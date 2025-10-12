@@ -157,7 +157,7 @@ The **Admission Controller** is a logical component within the Master responsibl
 -   **Responsibilities**:
     1.  **Request Validation**: It validates incoming `AdmitDatasetRequest` messages, ensuring the specified tenant and data source are valid.
     2.  **Source Interrogation**: It connects to the external data source (e.g., an Iceberg catalog) to resolve the request. For example, it translates a request for "the last 7 days of the `sales` table" into a specific list of manifest files, data files, and the corresponding table schema for that snapshot.
-    3.  **LoadPlan Generation**: It constructs the detailed, immutable `LoadPlan`. This plan contains all the physical information a worker needs, removing any ambiguity and ensuring workers do not need to contain complex source-specific logic.
+    3.  **LoadPlan Generation**: It constructs the detailed, immutable `LoadPlan`. This plan contains all the physical information a worker needs, including a **schema version lock** (`arrow_schema`) to protect against upstream schema evolution, removing any ambiguity and ensuring workers do not need to contain complex source-specific logic.
 -   **Decoupling**: This design decouples the workers from the specifics of the data lakehouse. Workers are simple "data loaders and queryers"; they only need to understand the `LoadPlan` format, not how to interact with an Iceberg catalog or an OLAP database.
 
 ## 5. Data Assignment and Sharding
@@ -386,10 +386,7 @@ message LoadPlan {
   // The name of the table as it should be created or replaced in the worker's
   // in-memory database (e.g., DuckDB).
   string destination_table_name = 3;
-
-  // The schema for the data being loaded, serialized as an Arrow IPC schema.
-  bytes arrow_schema = 4;
-}
+ }
 
 message DataSource {
   oneof source_type {
@@ -401,25 +398,24 @@ message DataSource {
 message IcebergSource {
   string table_name = 1;
   string snapshot_id = 2;
-  // The concrete set of physical data files to be loaded by the worker.
-  // This is resolved by the master's admission controller from the manifest.
+  // (Optional) The concrete set of physical data files to be loaded.
+  // If this list is empty, the worker is responsible for resolving the file
+  // list from the Iceberg table's metadata using the provided snapshot_id.
+  // The master will only populate this for exceptional cases, such as loading
+  // a curated subset of files.
   repeated DataFile files = 3;
 }
 
 message OlapSource {
   // Data Source Name (DSN) for the worker to connect to the OLAP source.
   string dsn = 1;
-  // The exact, executable query to generate the data snapshot.
-  // This is constructed by the Master's Admission Controller.
-  string snapshot_query = 2;
-
   // --- The following fields provide logical context for the worker ---
   // They can be used for logging, metrics, or schema validation.
-  string catalog = 3;
-  string database = 4;
-  string table = 5;
-  // The specific partition that this query targets.
-  map<string, string> partition_spec = 6;
+  string catalog = 2;
+  string database = 3;
+  string table = 4;
+  // The specific partition that this plan's data belongs to.
+  Partition partition = 5;
 }
 
 message DataFile {
@@ -459,7 +455,7 @@ message AdmitDatasetRequest {
 
   // A list of specific partitions to load. If empty, the latest snapshot or
   // the entire table may be loaded, depending on the source type.
-  repeated PartitionSpec partitions_to_load = 3;
+  repeated Partition partitions_to_load = 3;
 
   // Information about the source table.
   DataSourceIdentifier source = 4;
@@ -472,7 +468,7 @@ message AdmitDatasetResponse {
   string message = 2;
 }
 
-message PartitionSpec {
+message Partition {
   // A key-value representation of the partition to load.
   // Example: {"date": "2025-10-12", "country": "US"}
   map<string, string> values = 1;
