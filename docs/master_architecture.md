@@ -158,9 +158,106 @@ The **Admission Controller** is a logical component within the Master responsibl
     1.  **Request Validation**: It validates incoming `AdmitDatasetRequest` messages, ensuring the specified tenant and data source are valid.
     2.  **Source Interrogation**: It connects to the external data source (e.g., an Iceberg catalog) to resolve the request. For example, it translates a request for "the last 7 days of the `sales` table" into a specific list of manifest files, data files, and the corresponding table schema for that snapshot.
     3.  **LoadPlan Generation**: It constructs the detailed, immutable `LoadPlan`. This plan contains all the physical information a worker needs, removing any ambiguity and ensuring workers do not need to contain complex source-specific logic.
+    4.  **Quota Enforcement**: Admission applies per-tenant and global memory budgets before a `LoadPlan` is persisted. It consults the Capacity Planner (see Module Map) to ensure the resulting footprint keeps the cluster within reserved and burst allocations.
+    5.  **Idempotency & Auditing**: Every request receives a deterministic identifier. The controller persists its status transitions (`PENDING`, `PLANNED`, `ASSIGNED`, `FAILED`) so callers can safely retry without duplicating work. Audit trails are exported via the Metrics/Observability module.
+
+The Admission Controller produces two primary artifacts that other modules consume:
+
+-   `LoadPlan`: Immutable per-dataset instruction set that enumerates object storage URIs, schema descriptors, partition filters, and desired replication level.
+-   `DatasetSpec`: Canonical metadata for the dataset epoch (snapshot ID, version, TTL) which becomes the key for routing queries and cache invalidation.
+
+## 5. RPC Connection Management and Reliability Policy
+
+All communication between the Master and external actors (Admins and Workers) happens via gRPC. The Master provides two public services: `ManagementService` (control plane operations) and `EventStreamService` (worker coordination). The platform enforces consistent connection, retry, and timeout strategies to avoid runaway resource usage or cascading failures.
+
+### 5.1 ManagementService (Unary RPCs)
+
+-   **Client Expectations**: External callers (CLI, automation) issue unary RPCs. Each call must include a tenant-scoped authentication token and an idempotency key.
+-   **Server Policies**:
+    -   **Deadlines**: The server enforces a default 5s deadline for admission-related reads (catalog lookups may be longer, up to 30s) and a 60s deadline for long-running mutations (load planning). Requests exceeding server-side deadlines receive `DEADLINE_EXCEEDED`.
+    -   **Retry Semantics**: The API designates retryable errors using canonical status codes. `UNAVAILABLE`, `ABORTED`, and `RESOURCE_EXHAUSTED` return gRPC trailers containing a `retry-after-ms` hint for exponential backoff (base 200ms, jittered, capped at 5s).
+    -   **Validation Failures**: Invalid parameters return `INVALID_ARGUMENT` with structured field violations.
+    -   **Quota Rejections**: When admission would exceed policy budgets, the server returns `FAILED_PRECONDITION` and attaches the current utilization snapshot in the error metadata.
+-   **Server Implementation Notes**:
+    -   Requests are routed through a `UnaryConnectionManager` (see Module Map) that tracks active streams per tenant, limits concurrency, and exposes metrics (`grpc_server_handled_total`, `grpc_server_msg_received_total`).
+    -   Mutual TLS is mandatory; certificates are rotated by the Security & Identity module.
+
+### 5.2 EventStreamService (Bidirectional Streams)
+
+-   **Connection Lifecycle**:
+    1.  Workers dial the Master using mutual TLS and establish a stream with `OpenEventStream`.
+    2.  The Master authenticates the worker (tenant-scoped identity) and issues a session token bound to the gRPC stream.
+    3.  The stream is registered in the `StreamRegistry`, which maintains a mapping of `WorkerID -> StreamHandle` and tracks last-heartbeat timestamps.
+-   **Timeouts & Heartbeats**:
+    -   Workers must send a heartbeat every `heartbeat_interval` (default 5s). Missing two intervals triggers a soft warning; missing three causes the Master to proactively close the stream with `DEADLINE_EXCEEDED`.
+    -   The Master also sends keepalive pings (HTTP/2 PING) every 15s to detect half-open TCP connections.
+-   **Backpressure & Flow Control**:
+    -   Load assignments are pushed with credit-based flow control. Each worker advertises its `MaxInFlightAssignments`. The Master never sends more than this number without receiving an `AckEvent`.
+    -   If the worker's in-memory queue fills, it can send a `ThrottleEvent` to temporarily reduce pressure. The Master responds with a `RESOURCE_EXHAUSTED` status for new data onboarding attempts until the worker recovers.
+-   **Error Handling**:
+    -   Recoverable stream-level errors use `UNAVAILABLE` with a retry delay hint. Workers back off exponentially (base 500ms, cap 8s) before reconnecting.
+    -   Non-retryable errors (authentication failure, protocol violation) return `PERMISSION_DENIED` or `FAILED_PRECONDITION`, and the worker must re-register manually.
+    -   When the Master plans maintenance, it issues a `GracefulShutdownEvent` and closes the stream with status `OK`. Workers flush outstanding work and reconnect to the new leader.
+
+### 5.3 Error Taxonomy and Observability
+
+-   All gRPC handlers attach a `correlation-id` in response headers to link to structured logs.
+-   Retries, timeouts, and stream closures emit events into the Observability module to feed dashboards (per-tenant error rates, p99 latencies, stream churn).
+-   The `ConnectionPolicy` configuration (deadlines, heartbeat interval, retry caps) is stored in the Config Store module and supports dynamic reload without downtime.
+
+## 6. Master Module Map and Package Layout
+
+The Master codebase is organized into Go packages that correspond to clear control-plane responsibilities. Packages depend on one another through narrow interfaces defined in an `internal/api` layer to keep the surface well-encapsulated.
+
+| Package | Responsibility | Key Interfaces/Structs | Collaborators |
+|---------|----------------|------------------------|---------------|
+| `cmd/master` | Binary entry point; wires configuration, logging, telemetry, and starts the runtime. | `main()`, `bootstrapRuntime()` | Imports `runtime`, `config`, `transport/grpcserver`. |
+| `internal/runtime` | Supervises service startup/shutdown, leader election loop, and dependency injection. | `Runtime`, `Component`, `Lifecycle` | `cluster/election`, `transport`, `modules/*`. |
+| `internal/cluster/election` | Leader election and membership via etcd. | `LeaderElector`, `Candidate`, `LeaseConfig` | Consumed by `runtime`. |
+| `internal/cluster/workers` | Worker directory, stream registry, heartbeat processing, failover handling. | `WorkerDirectory`, `StreamRegistry`, `HeartbeatMonitor` | Uses `store`, `transport/grpcserver`. |
+| `internal/admission` | Validates dataset requests, generates `LoadPlan`s, applies quota policies. | `AdmissionController`, `Planner`, `QuotaEvaluator` | Collaborates with `modules/catalog`, `modules/capacity`. |
+| `internal/assignment` | Chooses placement strategy, issues `DataAssignmentEvent`s, manages rebalancing. | `AssignmentStrategy`, `AssignmentManager` | Depends on `cluster/workers`, `store`, `modules/capacity`. |
+| `internal/transport/grpcserver` | Hosts gRPC services, enforces connection policies, exposes interceptors. | `UnaryConnectionManager`, `StreamRegistry`, `AuthInterceptor` | Interfaces with `api/grpc` definitions, `security`. |
+| `internal/api/grpc` | Generated protobuf code and thin adapters exposing request/response types. | `pb.ManagementServiceServer`, `pb.EventStreamServiceServer` | Implemented by `modules/api`. |
+| `internal/modules/api` | Implements gRPC service handlers delegating to admission, assignment, worker modules. | `ManagementServer`, `EventStreamServer` | Calls into `admission`, `assignment`, `cluster/workers`. |
+| `internal/modules/catalog` | Abstractions over external metadata/catalog systems. | `CatalogClient`, `SnapshotResolver` | Used by `admission`. |
+| `internal/modules/capacity` | Tracks memory budgets, worker capacity, load shedding policies. | `CapacityPlanner`, `BudgetLedger` | Consulted by `admission`, `assignment`. |
+| `internal/modules/store` | Thin wrappers over etcd (KV, leases, watches). | `KVStore`, `LeaseManager`, `Txn` | Used by `cluster` and `assignment`. |
+| `internal/security` | mTLS, token validation, RBAC decisions. | `Authenticator`, `Authorizer`, `CertificateRotator` | Intercepts gRPC requests, integrates with `transport`. |
+| `internal/config` | Typed configuration loader supporting dynamic reload. | `ConfigProvider`, `Watcher` | Used by all modules during bootstrap. |
+| `internal/observability` | Metrics, logging, tracing, audit events. | `MetricsRegistry`, `AuditEmitter` | Receives hooks from all modules. |
+
+Interfaces exposed across packages remain in `internal` to prevent leaking implementation details to downstream repos. Each package includes an `interfaces.go` file that enumerates exported contracts and a corresponding `service.go` implementing the logic.
+
+### Core Abstractions
+
+-   **`LeaderElector`** – `Campaign(ctx) (Leadership, error)` returns a handle exposing `Done() <-chan struct{}` and `Resign(ctx)` so the runtime can coordinate orderly shutdowns.
+-   **`WorkerDirectory`** – Provides `Upsert(info WorkerInfo)`, `Remove(workerID string)`, and `Subscribe(ctx) <-chan WorkerEvent` to keep consumers in sync with worker liveness changes.
+-   **`AdmissionService`** – Implements unary gRPC handlers (`AdmitDataset`, `ListDatasets`) and emits internal `AdmissionJob` objects containing tenant context, source descriptors, and policy hints.
+-   **`LoadPlanner`** – Accepts `AdmissionJob` inputs and materializes `LoadPlanDescriptor` outputs (etcd keys, object manifests, replication policy) while deduplicating in-flight plans.
+-   **`AssignmentStrategy`** – Defines `Select(plan LoadPlanDescriptor, candidates []WorkerInfo) ([]Assignment, error)` enabling pluggable placement policies (round-robin, capacity-aware, replica fan-out).
+-   **`EventSink`** – Abstracts streaming communication with workers using `Send(workerID, msg)` and `Broadcast(tenantID, msg)` that wrap retry/backoff semantics consistent with the connection policy.
+-   **`ConfigProvider`** – Supplies strongly typed tenant/global configuration snapshots via `GetTenant(ctx, id)` and watch channels for hot reload (`WatchTenant(ctx, id) <-chan TenantConfig`).
+-   **`QuotaManager`** – Evaluates proposed `LoadPlanDescriptor`s against tenant and cluster budgets (`Evaluate(plan) (Decision, error)`) leveraging worker utilization telemetry.
+-   **`AuditLogger`** – Emits append-only audit events for admissions, assignments, and failovers with guaranteed durability (e.g., persisted to an immutable log sink).
+
+### Lifecycle Integration
+
+Every module implements the `Component` interface:
+
+```go
+type Component interface {
+        Start(ctx context.Context) error
+        Stop(ctx context.Context) error
+}
+```
+
+The `Runtime` coordinates component startup respecting dependencies (e.g., `transport/grpcserver` starts after `security` has loaded credentials). Shutdown is graceful: the runtime first stops the gRPC server (preventing new connections), then flushes outstanding assignments, finally relinquishing leadership via the election component.
+
+## 7. Extensibility Considerations
 -   **Decoupling**: This design decouples the workers from the specifics of the data lakehouse. Workers are simple "data loaders and queryers"; they only need to understand the `LoadPlan` format, not how to interact with an Iceberg catalog or an OLAP database.
 
-## 5. Data Assignment and Sharding
+## 8. Data Assignment and Sharding
 
 The system does not perform traditional database sharding. Instead, it manages the assignment of **immutable data epochs**, as defined by a `LoadPlan`, to workers. The process is initiated by the Admission Controller.
 
@@ -222,7 +319,7 @@ func rebalanceOnWorkerChange(ctx context.Context, client *clientv3.Client, faile
 }
 ```
 
-## 6. Etcd Key Organization
+## 9. Etcd Key Organization
 
 A well-defined `etcd` key structure is critical for discoverability, atomic operations, and efficient watches. We adopt a hierarchical, tenant-aware key schema.
 
@@ -261,7 +358,7 @@ A well-defined `etcd` key structure is critical for discoverability, atomic oper
 -   `/tenants/{tenant_id}`: Stores all configuration and metadata for a specific tenant, such as resource quotas and source definitions.
 -   `/config/global`: For cluster-wide settings.
 
-## 7. gRPC Protocols
+## 10. gRPC Protocols
 
 gRPC is the communication backbone for the system. Two primary services are defined:
 -   `ControlPlaneService`: For internal, real-time communication between the Master and Workers.
@@ -498,7 +595,7 @@ message OlapTable {
 }
 ```
 
-## 8. Multi-Tenancy Support
+## 11. Multi-Tenancy Support
 
 Multi-tenancy is a first-class citizen in the architecture, enforced at multiple levels by the Master. The central principle is that **a Worker belongs exclusively to one Tenant at a time**. This ensures strict resource isolation.
 
@@ -507,7 +604,7 @@ Multi-tenancy is a first-class citizen in the architecture, enforced at multiple
 -   **Worker Allocation**: A tenant is mapped to a pool of one or more workers. The `tenant_id` is a mandatory field in the worker's initial `RegisterEvent` and is used to scope its key in `etcd` (`/workers/{tenant_id}/{worker_id}`). This prevents cross-tenant data assignments.
 -   **gRPC Stream Context**: The `tenant_id` is present in every `EventStreamMessage`, ensuring that all communication is correctly scoped and authorized. The Master's gRPC handler will validate that the worker is registered to the tenant it claims to represent.
 
-## 9. Additional Details
+## 12. Additional Details
 
 ### Configuration Management
 
@@ -522,6 +619,8 @@ Multi-tenancy is a first-class citizen in the architecture, enforced at multiple
     -   `master_workers_registered_total`: A gauge of healthy workers per tenant.
     -   `master_data_assignment_duration_seconds`: A histogram of time taken to assign data.
     -   `etcd_client_latency_seconds`: Latency for `etcd` operations.
+
+These interfaces keep the Master extensible. For example, swapping the `AssignmentStrategy` or adding a new catalog connector only requires wiring in a new implementation without touching the core orchestration loop. Similarly, isolating the gRPC event handling behind `EventSink` allows unit testing of scheduling logic without standing up real streams.
 
 ### Sample YAML Configuration (for a Master node's bootstrap)
 
