@@ -10,7 +10,7 @@ bin
 prototype/bin
 testbin/*
 Dockerfile.cross
-
+.kilocode/
 
 # Test binary, build with `go test -c`
 *.test

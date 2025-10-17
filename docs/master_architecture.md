@@ -1,12 +1,159 @@
 # Master System Architecture: Distributed In-Memory Acceleration Layer
 
-## 1. Overall Architecture
+## 1. Guiding Principles for Revision
+
+This architecture document presents a revised, simplified design for the Master component. The primary goals of this revision are to reduce complexity, eliminate premature generalization, and improve developer productivity by adhering to the YAGNI ("You Ain't Gonna Need It") principle.
+
+The key changes focus on:
+- **Module Consolidation:** Grouping closely related functions into more cohesive packages to reduce fragmentation and boilerplate.
+- **Abstraction Simplification:** Retaining only the interfaces that provide immediate, clear value for extension or decoupling, and favoring concrete implementations for other functionalities.
+
+## 2. Overall Architecture Diagram
+
+```mermaid
+graph TB
+    %% External Layer - Clients
+    subgraph External["🌐 External Systems & Clients"]
+        direction LR
+        Admin["👤 Admin/Controller<br/>Management Interface"]
+        BI["📊 BI Tools<br/>Query Clients"]
+    end
+
+    %% Application Layer - Gateway
+    subgraph AppLayer["📡 Application Layer - Query Gateway"]
+        direction LR
+        Gateway["Data Gateway<br/>• Query Routing<br/>• Load Balancing<br/>• Failover"]
+    end
+
+    %% Control Plane - Master Cluster
+    subgraph ControlPlane["🎯 Control Plane - Master Cluster"]
+        direction TB
+        
+        subgraph MasterNodes["Master Nodes (HA Cluster)"]
+            direction LR
+            M1["Master-1<br/>Follower"]
+            M2["Master-2<br/>⭐ Leader"]
+            M3["Master-3<br/>Follower"]
+        end
+        
+        subgraph MasterComponents["Leader Components"]
+            direction TB
+            
+            subgraph API["gRPC API Layer"]
+                MgmtAPI["ManagementService<br/>• AdmitDataset<br/>• ListDatasets"]
+                CtrlAPI["ControlPlaneService<br/>• EventStream<br/>• Worker Coordination"]
+            end
+            
+            subgraph CoreLogic["Core Business Logic"]
+                Admission["Admission Controller<br/>• Request Validation<br/>• Source Interrogation<br/>• LoadPlan Generation<br/>• Quota Enforcement"]
+                Assignment["Assignment Manager<br/>• Worker Selection<br/>• Load Balancing<br/>• Rebalancing"]
+                Cluster["Cluster Manager<br/>• Worker Liveness<br/>• Health Monitoring<br/>• Failover Detection"]
+            end
+            
+            API --> CoreLogic
+        end
+        
+        subgraph StateStore["Distributed State Store"]
+            Etcd["etcd Cluster<br/>• Leader Election (RAFT)<br/>• Worker Registry<br/>• Assignment State<br/>• Tenant Config<br/>• Global Config"]
+        end
+        
+        MasterNodes --> StateStore
+        CoreLogic --> StateStore
+    end
+
+    %% Data Plane - Workers
+    subgraph DataPlane["⚡ Data Plane - Worker Cluster"]
+        direction TB
+        
+        subgraph TenantA["Tenant A Workers"]
+            direction LR
+            W1["Worker-1<br/>🔷 DuckDB Engine<br/>📦 Epoch Cache<br/>💾 In-Memory Data"]
+            W2["Worker-2<br/>🔷 DuckDB Engine<br/>📦 Epoch Cache<br/>💾 In-Memory Data"]
+        end
+        
+        subgraph TenantB["Tenant B Workers"]
+            direction LR
+            W3["Worker-3<br/>🔷 DuckDB Engine<br/>📦 Epoch Cache<br/>💾 In-Memory Data"]
+            W4["Worker-N<br/>🔷 DuckDB Engine<br/>📦 Epoch Cache<br/>💾 In-Memory Data"]
+        end
+    end
+
+    %% Infrastructure Layer - Data Sources
+    subgraph Infrastructure["🗄️ Infrastructure Layer - Data Sources"]
+        direction LR
+        
+        subgraph Lakehouse["Data Lakehouse"]
+            Iceberg["Apache Iceberg<br/>• Table Format<br/>• Metadata Catalog<br/>• Snapshot Management"]
+        end
+        
+        subgraph OLAP["OLAP Systems"]
+            StarRocks["StarRocks<br/>• Analytical Engine<br/>• Query Processing<br/>• Data Snapshots"]
+        end
+    end
+
+    %% Connections - Control Flow
+    Admin -->|"1. AdmitDataset RPC"| MgmtAPI
+    MgmtAPI --> Admission
+    Admission -->|"2. Resolve Metadata"| Iceberg
+    Admission -->|"2. Resolve Metadata"| StarRocks
+    Admission --> Assignment
+    Assignment -->|"3. Persist Assignment"| Etcd
+    
+    %% Connections - Worker Management
+    CtrlAPI <-->|"4. Bi-directional Stream<br/>Register/Heartbeat/Assignment"| W1
+    CtrlAPI <-->|"4. Bi-directional Stream<br/>Register/Heartbeat/Assignment"| W2
+    CtrlAPI <-->|"4. Bi-directional Stream<br/>Register/Heartbeat/Assignment"| W3
+    CtrlAPI <-->|"4. Bi-directional Stream<br/>Register/Heartbeat/Assignment"| W4
+    
+    Cluster -->|"5. Monitor Leases"| Etcd
+    
+    %% Connections - Data Pull
+    W1 -.->|"6. Pull Data Files"| Iceberg
+    W2 -.->|"6. Pull Data Files"| Iceberg
+    W3 -.->|"6. Pull Query Results"| StarRocks
+    W4 -.->|"6. Pull Query Results"| StarRocks
+    
+    %% Connections - Query Flow
+    BI -->|"7. Query Request"| Gateway
+    Gateway -->|"8. Lookup Assignment"| Etcd
+    Gateway -->|"9. Route Query"| W1
+    Gateway -->|"9. Route Query"| W2
+    Gateway -->|"9. Route Query"| W3
+    Gateway -->|"9. Route Query"| W4
+
+    %% Styling for Dark Mode - High Contrast
+    classDef external fill:#4a5568,stroke:#e2e8f0,stroke-width:3px,color:#f7fafc
+    classDef appLayer fill:#2d3748,stroke:#90cdf4,stroke-width:3px,color:#e6fffa
+    classDef controlPlane fill:#1a365d,stroke:#63b3ed,stroke-width:3px,color:#bee3f8
+    classDef masterNode fill:#2c5282,stroke:#90cdf4,stroke-width:2px,color:#e6fffa
+    classDef api fill:#2a4365,stroke:#4299e1,stroke-width:2px,color:#bee3f8
+    classDef logic fill:#1e4e8c,stroke:#4299e1,stroke-width:2px,color:#bee3f8
+    classDef state fill:#234e52,stroke:#4fd1c5,stroke-width:3px,color:#b2f5ea
+    classDef dataPlane fill:#22543d,stroke:#68d391,stroke-width:3px,color:#c6f6d5
+    classDef worker fill:#276749,stroke:#68d391,stroke-width:2px,color:#c6f6d5
+    classDef infrastructure fill:#742a2a,stroke:#fc8181,stroke-width:3px,color:#fed7d7
+    classDef dataSource fill:#9b2c2c,stroke:#fc8181,stroke-width:2px,color:#fed7d7
+
+    class External external
+    class AppLayer,Gateway appLayer
+    class ControlPlane,MasterNodes,MasterComponents,API,CoreLogic controlPlane
+    class M1,M2,M3 masterNode
+    class MgmtAPI,CtrlAPI api
+    class Admission,Assignment,Cluster logic
+    class StateStore,Etcd state
+    class DataPlane,TenantA,TenantB dataPlane
+    class W1,W2,W3,W4 worker
+    class Infrastructure,Lakehouse,OLAP infrastructure
+    class Iceberg,StarRocks dataSource
+```
+
+## 3. Overall Architecture
 
 The Master is the central coordination component of the distributed, memory-centric acceleration layer. It acts as a stateful control plane, orchestrating data placement and lifecycle across a cluster of Worker nodes without managing the data itself. By leveraging a distributed consensus store (etcd), it maintains the global state of the cluster, including worker status and data assignments. Its primary role is to ensure that hot data from the underlying data lakehouse (e.g., Iceberg tables, OLAP snapshots) is available in memory on the correct Workers, ready to be queried with low latency via the Data Gateway.
 
 The system follows a **master-worker** architecture where the Master is the brain and the Workers are the high-performance data engines. The data onboarding and assignment flow is as follows:
 
-1.  **Admission Request**: An external administrator or service interacts with the Master's `ManagementService` gRPC API to request that a specific dataset (e.g., a set of partitions from an Iceberg table) be loaded into the speed layer.
+1.  **Admission Request**: An external administrator or service interacts with the Master's `ManagementService` gRPC API to request that a specific dataset be loaded into the speed layer.
 2.  **Admission Control**: The Master's internal **Admission Controller** receives this request. It connects to the underlying data source (e.g., Iceberg catalog) to resolve the request into a concrete set of data files, schema, and partition information.
 3.  **Load Plan Generation**: The Admission Controller generates a detailed `LoadPlan`. This plan is an explicit, immutable recipe that tells a Worker exactly what data to pull and how to load it.
 4.  **Data Assignment**: The Master determines which Worker(s) should handle the `LoadPlan` and persists this assignment in `etcd`.
@@ -15,37 +162,7 @@ The system follows a **master-worker** architecture where the Master is the brai
 
 This architecture treats the in-memory layer as a **CPU cache for the data lakehouse**. It holds the hottest, most frequently accessed data subsets in a high-speed medium (RAM) to accelerate queries, while the larger, colder dataset remains in the lakehouse.
 
-### High-Level System Diagram
-
-```text
-+----------------------+      +----------------------+
-|  Admin / Controller  |----->|   ManagementService  |
-+----------------------+ gRPC | (External Master API)|
-                              +----------+-----------+
-                                         |
-+----------------------+      +----------------------+      +----------------------+
-|   Client/BI Tools    |----->|     Data Gateway     |<---->|        Master        |
-+----------------------+      +----------------------+      | (Coordination/etcd)  |
-                                       ^                     +----------+-----------+
-                                       | gRPC (Query)                   | gRPC (Event Stream)
-                                       v                                v
-+----------------------+      +----------------------+      +----------------------+
-|    Worker 1 (RAM)    |      |    Worker 2 (RAM)    |      |    Worker N (RAM)    |
-| - DuckDB Engine      |      | - DuckDB Engine      |      | - DuckDB Engine      |
-| - Immutable Epoch A  |      | - Immutable Epoch B  |      | - Immutable Epoch C  |
-+----------------------+      +----------------------+      +----------------------+
-        ^ (Data Pull)                   ^ (Data Pull)                   ^ (Data Pull)
-        |                               |                               |
-        +-------------------------------+-------------------------------+
-                                        |
-                                        v
-                          +--------------------------+
-                          |   Data Lakehouse         |
-                          | (Iceberg / OLAP Source)  |
-                          +--------------------------+
-```
-
-## 2. Master Cluster Management
+## 4. Master Cluster Management
 
 To ensure high availability and prevent a single point of failure, the Master is deployed as a distributed cluster. It leverages an embedded `etcd` instance for all coordination, state management, and consensus, aligning with Go's principles of simplicity and robust concurrency.
 
@@ -55,66 +172,7 @@ To ensure high availability and prevent a single point of failure, the Master is
 -   **Leader Election**: The cluster elects a single active leader using `etcd`'s built-in election API, which is based on the RAFT consensus algorithm. The leader is responsible for making all critical decisions, such as data assignments and worker notifications. Follower nodes remain on standby, ready to take over if the leader fails. They use `etcd` watches to observe state changes made by the leader and maintain a consistent view.
 -   **Failover**: If the leader node fails, its `etcd` session will time out, and its leadership lease will expire. The `etcd` election library ensures that one of the followers will be promptly elected as the new leader, minimizing downtime.
 
-### Golang Pseudocode: Leader Election
-
-This snippet demonstrates how a Master node would participate in leader election using the official `etcd` client library.
-
-```go
-package master
-
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/client/v3/concurrency"
-)
-
-// becomeLeader attempts to acquire leadership and blocks until it is lost.
-// It runs the provided `leaderLoop` function which contains the leader's duties.
-func becomeLeader(ctx context.Context, client *clientv3.Client, masterID string) error {
-	s, err := concurrency.newSession(client)
-	if err != nil {
-		return fmt.Errorf("failed to create etcd session: %w", err)
-	}
-	defer s.Close()
-
-	// The election prefix ensures all masters compete for the same lock.
-	e := concurrency.NewElection(s, "/election/master")
-
-	// Campaign blocks until this node is elected.
-	if err := e.Campaign(ctx, masterID); err != nil {
-		return fmt.Errorf("failed to campaign for leadership: %w", err)
-	}
-	fmt.Printf("%s elected as leader\n", masterID)
-
-	// Leadership is held until the context is canceled or the session is lost.
-	// We run the leader's main logic loop here.
-	leaderLoop(ctx)
-
-	// Resign leadership gracefully if the context is done.
-	defer func() {
-		if resignErr := e.Resign(context.Background()); resignErr != nil {
-			fmt.Printf("failed to resign leadership: %v\n", resignErr)
-		}
-	}()
-
-	fmt.Printf("%s lost leadership\n", masterID)
-	return nil
-}
-
-// leaderLoop is the primary function executed by the elected leader.
-func leaderLoop(ctx context.Context) {
-	fmt.Println("Leader loop started. Performing leadership duties.")
-	// Example duties: watch for new data, assign to workers, monitor cluster.
-	<-ctx.Done()
-	fmt.Println("Leader loop stopping.")
-}
-
-```
-
-## 3. Worker Status Management
+## 5. Worker Status Management
 
 The Master is solely responsible for tracking the health and status of all Worker nodes. Workers are designed to be simple and unaware of `etcd`; they communicate with the Master exclusively via a persistent, bidirectional gRPC stream. This event-driven approach simplifies the communication model and ensures real-time state synchronization.
 
@@ -149,7 +207,7 @@ Worker                  Master (Leader)               etcd
   |                        |                           |
 ```
 
-## 4. Admission Control and Data Onboarding
+## 6. Admission Control and Data Onboarding
 
 The **Admission Controller** is a logical component within the Master responsible for managing the data lifecycle in the speed layer. It acts as the gatekeeper, translating high-level requests into concrete, executable `LoadPlan`s for the workers.
 
@@ -158,168 +216,318 @@ The **Admission Controller** is a logical component within the Master responsibl
     1.  **Request Validation**: It validates incoming `AdmitDatasetRequest` messages, ensuring the specified tenant and data source are valid.
     2.  **Source Interrogation**: It connects to the external data source (e.g., an Iceberg catalog) to resolve the request. For example, it translates a request for "the last 7 days of the `sales` table" into a specific list of manifest files, data files, and the corresponding table schema for that snapshot.
     3.  **LoadPlan Generation**: It constructs the detailed, immutable `LoadPlan`. This plan contains all the physical information a worker needs, removing any ambiguity and ensuring workers do not need to contain complex source-specific logic.
-    4.  **Quota Enforcement**: Admission applies per-tenant and global memory budgets before a `LoadPlan` is persisted. It consults the Capacity Planner (see Module Map) to ensure the resulting footprint keeps the cluster within reserved and burst allocations.
-    5.  **Idempotency & Auditing**: Every request receives a deterministic identifier. The controller persists its status transitions (`PENDING`, `PLANNED`, `ASSIGNED`, `FAILED`) so callers can safely retry without duplicating work. Audit trails are exported via the Metrics/Observability module.
+    4.  **Quota Enforcement**: Admission applies per-tenant and global memory budgets before a `LoadPlan` is persisted. It consults the Capacity Planner to ensure the resulting footprint keeps the cluster within reserved allocations.
+    5.  **Idempotency & Auditing**: Every request receives a deterministic identifier. The controller persists its status transitions (`PENDING`, `PLANNED`, `ASSIGNED`, `FAILED`) so callers can safely retry without duplicating work. Audit trails are exported via the observability module.
 
-The Admission Controller produces two primary artifacts that other modules consume:
-
--   `LoadPlan`: Immutable per-dataset instruction set that enumerates object storage URIs, schema descriptors, partition filters, and desired replication level.
--   `DatasetSpec`: Canonical metadata for the dataset epoch (snapshot ID, version, TTL) which becomes the key for routing queries and cache invalidation.
-
-## 5. RPC Connection Management and Reliability Policy
-
-All communication between the Master and external actors (Admins and Workers) happens via gRPC. The Master provides two public services: `ManagementService` (control plane operations) and `EventStreamService` (worker coordination). The platform enforces consistent connection, retry, and timeout strategies to avoid runaway resource usage or cascading failures.
-
-### 5.1 ManagementService (Unary RPCs)
-
--   **Client Expectations**: External callers (CLI, automation) issue unary RPCs. Each call must include a tenant-scoped authentication token and an idempotency key.
--   **Server Policies**:
-    -   **Deadlines**: The server enforces a default 5s deadline for admission-related reads (catalog lookups may be longer, up to 30s) and a 60s deadline for long-running mutations (load planning). Requests exceeding server-side deadlines receive `DEADLINE_EXCEEDED`.
-    -   **Retry Semantics**: The API designates retryable errors using canonical status codes. `UNAVAILABLE`, `ABORTED`, and `RESOURCE_EXHAUSTED` return gRPC trailers containing a `retry-after-ms` hint for exponential backoff (base 200ms, jittered, capped at 5s).
-    -   **Validation Failures**: Invalid parameters return `INVALID_ARGUMENT` with structured field violations.
-    -   **Quota Rejections**: When admission would exceed policy budgets, the server returns `FAILED_PRECONDITION` and attaches the current utilization snapshot in the error metadata.
--   **Server Implementation Notes**:
-    -   Requests are routed through a `UnaryConnectionManager` (see Module Map) that tracks active streams per tenant, limits concurrency, and exposes metrics (`grpc_server_handled_total`, `grpc_server_msg_received_total`).
-    -   Mutual TLS is mandatory; certificates are rotated by the Security & Identity module.
-
-### 5.2 EventStreamService (Bidirectional Streams)
-
--   **Connection Lifecycle**:
-    1.  Workers dial the Master using mutual TLS and establish a stream with `OpenEventStream`.
-    2.  The Master authenticates the worker (tenant-scoped identity) and issues a session token bound to the gRPC stream.
-    3.  The stream is registered in the `StreamRegistry`, which maintains a mapping of `WorkerID -> StreamHandle` and tracks last-heartbeat timestamps.
--   **Timeouts & Heartbeats**:
-    -   Workers must send a heartbeat every `heartbeat_interval` (default 5s). Missing two intervals triggers a soft warning; missing three causes the Master to proactively close the stream with `DEADLINE_EXCEEDED`.
-    -   The Master also sends keepalive pings (HTTP/2 PING) every 15s to detect half-open TCP connections.
--   **Backpressure & Flow Control**:
-    -   Load assignments are pushed with credit-based flow control. Each worker advertises its `MaxInFlightAssignments`. The Master never sends more than this number without receiving an `AckEvent`.
-    -   If the worker's in-memory queue fills, it can send a `ThrottleEvent` to temporarily reduce pressure. The Master responds with a `RESOURCE_EXHAUSTED` status for new data onboarding attempts until the worker recovers.
--   **Error Handling**:
-    -   Recoverable stream-level errors use `UNAVAILABLE` with a retry delay hint. Workers back off exponentially (base 500ms, cap 8s) before reconnecting.
-    -   Non-retryable errors (authentication failure, protocol violation) return `PERMISSION_DENIED` or `FAILED_PRECONDITION`, and the worker must re-register manually.
-    -   When the Master plans maintenance, it issues a `GracefulShutdownEvent` and closes the stream with status `OK`. Workers flush outstanding work and reconnect to the new leader.
-
-### 5.3 Error Taxonomy and Observability
-
--   All gRPC handlers attach a `correlation-id` in response headers to link to structured logs.
--   Retries, timeouts, and stream closures emit events into the Observability module to feed dashboards (per-tenant error rates, p99 latencies, stream churn).
--   The `ConnectionPolicy` configuration (deadlines, heartbeat interval, retry caps) is stored in the Config Store module and supports dynamic reload without downtime.
-
-## 6. Master Module Map and Package Layout
-
-The Master codebase is organized into Go packages that correspond to clear control-plane responsibilities. Packages depend on one another through narrow interfaces defined in an `internal/api` layer to keep the surface well-encapsulated.
-
-| Package | Responsibility | Key Interfaces/Structs | Collaborators |
-|---------|----------------|------------------------|---------------|
-| `cmd/master` | Binary entry point; wires configuration, logging, telemetry, and starts the runtime. | `main()`, `bootstrapRuntime()` | Imports `runtime`, `config`, `transport/grpcserver`. |
-| `internal/runtime` | Supervises service startup/shutdown, leader election loop, and dependency injection. | `Runtime`, `Component`, `Lifecycle` | `cluster/election`, `transport`, `modules/*`. |
-| `internal/cluster/election` | Leader election and membership via etcd. | `LeaderElector`, `Candidate`, `LeaseConfig` | Consumed by `runtime`. |
-| `internal/cluster/workers` | Worker directory, stream registry, heartbeat processing, failover handling. | `WorkerDirectory`, `StreamRegistry`, `HeartbeatMonitor` | Uses `store`, `transport/grpcserver`. |
-| `internal/admission` | Validates dataset requests, generates `LoadPlan`s, applies quota policies. | `AdmissionController`, `Planner`, `QuotaEvaluator` | Collaborates with `modules/catalog`, `modules/capacity`. |
-| `internal/assignment` | Chooses placement strategy, issues `DataAssignmentEvent`s, manages rebalancing. | `AssignmentStrategy`, `AssignmentManager` | Depends on `cluster/workers`, `store`, `modules/capacity`. |
-| `internal/transport/grpcserver` | Hosts gRPC services, enforces connection policies, exposes interceptors. | `UnaryConnectionManager`, `StreamRegistry`, `AuthInterceptor` | Interfaces with `api/grpc` definitions, `security`. |
-| `internal/api/grpc` | Generated protobuf code and thin adapters exposing request/response types. | `pb.ManagementServiceServer`, `pb.EventStreamServiceServer` | Implemented by `modules/api`. |
-| `internal/modules/api` | Implements gRPC service handlers delegating to admission, assignment, worker modules. | `ManagementServer`, `EventStreamServer` | Calls into `admission`, `assignment`, `cluster/workers`. |
-| `internal/modules/catalog` | Abstractions over external metadata/catalog systems. | `CatalogClient`, `SnapshotResolver` | Used by `admission`. |
-| `internal/modules/capacity` | Tracks memory budgets, worker capacity, load shedding policies. | `CapacityPlanner`, `BudgetLedger` | Consulted by `admission`, `assignment`. |
-| `internal/modules/store` | Thin wrappers over etcd (KV, leases, watches). | `KVStore`, `LeaseManager`, `Txn` | Used by `cluster` and `assignment`. |
-| `internal/security` | mTLS, token validation, RBAC decisions. | `Authenticator`, `Authorizer`, `CertificateRotator` | Intercepts gRPC requests, integrates with `transport`. |
-| `internal/config` | Typed configuration loader supporting dynamic reload. | `ConfigProvider`, `Watcher` | Used by all modules during bootstrap. |
-| `internal/observability` | Metrics, logging, tracing, audit events. | `MetricsRegistry`, `AuditEmitter` | Receives hooks from all modules. |
-
-Interfaces exposed across packages remain in `internal` to prevent leaking implementation details to downstream repos. Each package includes an `interfaces.go` file that enumerates exported contracts and a corresponding `service.go` implementing the logic.
-
-### Core Abstractions
-
--   **`LeaderElector`** – `Campaign(ctx) (Leadership, error)` returns a handle exposing `Done() <-chan struct{}` and `Resign(ctx)` so the runtime can coordinate orderly shutdowns.
--   **`WorkerDirectory`** – Provides `Upsert(info WorkerInfo)`, `Remove(workerID string)`, and `Subscribe(ctx) <-chan WorkerEvent` to keep consumers in sync with worker liveness changes.
--   **`AdmissionService`** – Implements unary gRPC handlers (`AdmitDataset`, `ListDatasets`) and emits internal `AdmissionJob` objects containing tenant context, source descriptors, and policy hints.
--   **`LoadPlanner`** – Accepts `AdmissionJob` inputs and materializes `LoadPlanDescriptor` outputs (etcd keys, object manifests, replication policy) while deduplicating in-flight plans.
--   **`AssignmentStrategy`** – Defines `Select(plan LoadPlanDescriptor, candidates []WorkerInfo) ([]Assignment, error)` enabling pluggable placement policies (round-robin, capacity-aware, replica fan-out).
--   **`EventSink`** – Abstracts streaming communication with workers using `Send(workerID, msg)` and `Broadcast(tenantID, msg)` that wrap retry/backoff semantics consistent with the connection policy.
--   **`ConfigProvider`** – Supplies strongly typed tenant/global configuration snapshots via `GetTenant(ctx, id)` and watch channels for hot reload (`WatchTenant(ctx, id) <-chan TenantConfig`).
--   **`QuotaManager`** – Evaluates proposed `LoadPlanDescriptor`s against tenant and cluster budgets (`Evaluate(plan) (Decision, error)`) leveraging worker utilization telemetry.
--   **`AuditLogger`** – Emits append-only audit events for admissions, assignments, and failovers with guaranteed durability (e.g., persisted to an immutable log sink).
-
-### Lifecycle Integration
-
-Every module implements the `Component` interface:
-
-```go
-type Component interface {
-        Start(ctx context.Context) error
-        Stop(ctx context.Context) error
-}
-```
-
-The `Runtime` coordinates component startup respecting dependencies (e.g., `transport/grpcserver` starts after `security` has loaded credentials). Shutdown is graceful: the runtime first stops the gRPC server (preventing new connections), then flushes outstanding assignments, finally relinquishing leadership via the election component.
-
-## 7. Extensibility Considerations
--   **Decoupling**: This design decouples the workers from the specifics of the data lakehouse. Workers are simple "data loaders and queryers"; they only need to understand the `LoadPlan` format, not how to interact with an Iceberg catalog or an OLAP database.
-
-## 8. Data Assignment and Sharding
+## 7. Data Assignment and Sharding
 
 The system does not perform traditional database sharding. Instead, it manages the assignment of **immutable data epochs**, as defined by a `LoadPlan`, to workers. The process is initiated by the Admission Controller.
 
 -   **Assignment Logic**: Once a `LoadPlan` is generated, the Master leader selects available Workers based on a load balancing strategy.
     -   **Round-Robin**: Simple and effective for homogenous clusters.
-    -   **Hash-Based**: A consistent hashing algorithm can be used to map a data epoch (e.g., hash of `{table_name, date_partition}`) to a Worker. This minimizes reassignments when Workers are added or removed.
+    -   **Hash-Based**: A consistent hashing algorithm can be used to map a data epoch to a Worker. This minimizes reassignments when Workers are added or removed.
     -   **Capacity-Aware**: The Master considers worker capacity (CPU, available memory) reported in `HeartbeatEvent` messages to make more intelligent assignments.
 -   **Rebalancing**: The Master watches the `/workers/` prefix in `etcd`.
     -   **Worker Added**: When a new worker key appears, the Master may trigger a rebalancing to offload some data assignments from existing workers to the new one to distribute load.
     -   **Worker Removed**: When a worker key is deleted (due to failure), the Master reassigns its data epochs to other healthy workers.
 -   **Persistence**: All data assignments are persisted in `etcd` under a key like `/assignments/{tenant_id}/{dataset_id}/{epoch_id}`. The value would contain the `LoadPlan` and the list of `worker_id`s responsible for it.
 
-### Golang Pseudocode: Data Assignment
+## 8. Multi-Tenancy Support
 
-```go
-package master
+Multi-tenancy is a first-class citizen in the architecture, enforced at multiple levels by the Master. The central principle is that **a Worker belongs exclusively to one Tenant at a time**. This ensures strict resource isolation.
 
-import (
-	"context"
-	"errors"
-	"fmt"
+-   **Data Isolation**: All data assignments in `etcd` are namespaced by `tenant_id`, making it impossible for one tenant's configuration to affect another.
+-   **Resource Quotas**: Tenant configurations stored under `/tenants/{tenant_id}/config` define hard limits on resources (e.g., total memory, CPU cores). The Master's assignment logic respects these quotas, refusing to assign new data epochs if a tenant would exceed its allocation.
+-   **Worker Allocation**: A tenant is mapped to a pool of one or more workers. The `tenant_id` is a mandatory field in the worker's initial `RegisterEvent` and is used to scope its key in `etcd` (`/workers/{tenant_id}/{worker_id}`). This prevents cross-tenant data assignments.
+-   **gRPC Stream Context**: The `tenant_id` is present in every `EventStreamMessage`, ensuring that all communication is correctly scoped and authorized. The Master's gRPC handler will validate that the worker is registered to the tenant it claims to represent.
 
-	"go.etcd.io/etcd/client/v3"
-)
+## 9. RPC Connection Management and Reliability Policy
 
-// Naive round-robin assignment for demonstration.
-var nextWorkerIndex = 0
+All communication between the Master and external actors (Admins and Workers) happens via gRPC. The Master provides two public services: `ManagementService` (control plane operations) and `ControlPlaneService` (worker coordination). The platform enforces consistent connection, retry, and timeout strategies.
 
-// assignDataToWorker selects a worker and persists the assignment in etcd.
-func assignDataToWorker(ctx context.Context, client *clientv3.Client, availableWorkers []string, dataEpochID string) error {
-	if len(availableWorkers) == 0 {
-		return errors.New("no available workers to assign data")
-	}
+### 9.1 ManagementService (Unary RPCs)
 
-	// Simple round-robin logic
-	workerID := availableWorkers[nextWorkerIndex%len(availableWorkers)]
-	nextWorkerIndex++
+-   **Client Expectations**: External callers (CLI, automation) issue unary RPCs. Each call must include a tenant-scoped authentication token and an idempotency key.
+-   **Server Policies**:
+    -   **Deadlines**: The server enforces a default 5s deadline for admission-related reads and a 60s deadline for long-running mutations.
+    -   **Retry Semantics**: The API designates retryable errors (`UNAVAILABLE`, `ABORTED`) with a `retry-after-ms` hint for exponential backoff.
+    -   **Validation & Quota Failures**: Invalid parameters return `INVALID_ARGUMENT`; budget rejections return `FAILED_PRECONDITION`.
 
-	assignmentKey := fmt.Sprintf("/assignments/%s", dataEpochID)
-	assignmentValue := workerID // In reality, could be a JSON with replica info
+### 9.2 ControlPlaneService (Bidirectional Streams)
 
-	_, err := client.Put(ctx, assignmentKey, assignmentValue)
-	if err != nil {
-		return fmt.Errorf("failed to persist assignment in etcd: %w", err)
-	}
+-   **Connection Lifecycle**: Workers establish a long-lived stream. The Master authenticates the worker and registers the stream.
+-   **Timeouts & Heartbeats**: Workers must send a heartbeat every 5s. Missing three causes the Master to proactively close the stream. The Master also sends keepalive pings every 15s to detect half-open connections.
+-   **Backpressure & Flow Control**: Load assignments are pushed with credit-based flow control.
+-   **Error Handling**: Recoverable stream-level errors use `UNAVAILABLE` with a retry delay hint. Workers back off exponentially before reconnecting.
 
-	// After persisting, notify the worker via the gRPC stream
-	// stream.Send(&EventStreamMessage{payload: &DataAssignmentEvent{...}})
-	return nil
+## 10. gRPC Protocols
+
+gRPC is the communication backbone for the system. Two primary services are defined:
+-   `ControlPlaneService`: For internal, real-time communication between the Master and Workers.
+-   `ManagementService`: For external, administrative control over the Master.
+
+### `control_plane_service.proto`
+
+```protobuf
+syntax = "proto3";
+
+package speedlayer.v1;
+
+option go_package = "github.com/leibrix/speedlayer/api/v1";
+
+// ControlPlaneService defines the single, persistent stream for all
+// Master-Worker communication.
+service ControlPlaneService {
+  // EventStream is a long-lived, bidirectional stream. The first message from
+  // a worker MUST be a RegisterEvent.
+  rpc EventStream(stream EventStreamMessage) returns (stream EventStreamMessage);
 }
 
-// rebalanceOnWorkerChange is triggered by an etcd watch when a worker is added/removed.
-func rebalanceOnWorkerChange(ctx context.Context, client *clientv3.Client, failedWorkerID string) {
-	// 1. Find all data epochs assigned to the failed worker.
-	//    resp, err := client.Get(ctx, "/assignments/", clientv3.WithPrefix()) ...
-	// 2. For each epoch, re-assign it to a healthy worker.
-	//    assignDataToWorker(...)
-	// 3. Delete the old, invalid assignment.
+// EventStreamMessage is the union type for all messages exchanged
+// between the Master and a Worker.
+message EventStreamMessage {
+  // A unique identifier for the event, used for logging and correlation.
+  string event_id = 1;
+  // Tenant and Worker IDs provide context for the event.
+  string tenant_id = 2;
+  string worker_id = 3;
+
+  oneof payload {
+    // ---- Events initiated by the Worker ----
+    RegisterEvent register_event = 4;
+    HeartbeatEvent heartbeat_event = 5;
+    DataPullStatusUpdateEvent data_pull_status_update = 6;
+
+    // ---- Events initiated by the Master ----
+    RegistrationAckEvent registration_ack = 7;
+    DataAssignmentEvent data_assignment = 8;
+    HeartbeatAckEvent heartbeat_ack = 9;
+  }
+}
+
+// --- Worker -> Master Event Payloads ---
+
+message RegisterEvent {
+  string address = 1;
+  WorkerCapacity capacity = 2;
+}
+
+message HeartbeatEvent {
+  ResourceStatus status = 1;
+}
+
+message DataPullStatusUpdateEvent {
+  string dataset_id = 1;
+  string epoch_id = 2;
+  enum Status {
+    UNKNOWN = 0;
+    IN_PROGRESS = 1;
+    COMPLETED = 2;
+    FAILED = 3;
+  }
+  Status status = 3;
+  string error_message = 4;
+}
+
+// --- Master -> Worker Event Payloads ---
+
+message RegistrationAckEvent {
+  int32 heartbeat_interval_seconds = 1;
+}
+
+message DataAssignmentEvent {
+  string dataset_id = 1;
+  string epoch_id = 2;
+  LoadPlan load_plan = 3;
+}
+
+message HeartbeatAckEvent {
+  enum Action {
+    NONE = 0;
+    DRAIN = 1;
+  }
+  Action requested_action = 1;
+}
+
+// --- Common Sub-Messages ---
+
+message WorkerCapacity {
+  int64 memory_bytes = 1;
+  int32 cpu_cores = 2;
+}
+
+message ResourceStatus {
+  int64 memory_used_bytes = 1;
+  float cpu_load_avg_5m = 2;
+}
+
+message LoadPlan {
+  string plan_id = 1;
+  DataSource source = 2;
+  string destination_table_name = 3;
+  bytes arrow_schema = 4;
+}
+
+message DataSource {
+  oneof source_type {
+    IcebergSource iceberg = 1;
+    OlapSource olap = 2;
+  }
+}
+
+message IcebergSource {
+  string table_name = 1;
+  string snapshot_id = 2;
+  repeated DataFile files = 3;
+}
+
+message OlapSource {
+  string dsn = 1;
+  string snapshot_query = 2;
+  string catalog = 3;
+  string database = 4;
+  string table = 5;
+  map<string, string> partition_spec = 6;
+}
+
+message DataFile {
+  string uri = 1;
+  string format = 2;
+  int64 size_bytes = 3;
+  map<string, string> partition_values = 4;
 }
 ```
 
-## 9. Etcd Key Organization
+### `management_service.proto`
+
+```protobuf
+syntax = "proto3";
+
+package speedlayer.v1;
+
+option go_package = "github.com/leibrix/speedlayer/api/v1";
+
+// ManagementService provides an external API for controlling the speed layer.
+service ManagementService {
+  // AdmitDataset instructs the Master to load a specific dataset into the speed layer.
+  rpc AdmitDataset(AdmitDatasetRequest) returns (AdmitDatasetResponse);
+}
+
+message AdmitDatasetRequest {
+  string tenant_id = 1;
+  string dataset_id = 2;
+  repeated PartitionSpec partitions_to_load = 3;
+  DataSourceIdentifier source = 4;
+}
+
+message AdmitDatasetResponse {
+  string epoch_id = 1;
+  string message = 2;
+}
+
+message PartitionSpec {
+  map<string, string> values = 1;
+}
+
+message DataSourceIdentifier {
+   oneof source_type {
+    IcebergTable iceberg_table = 1;
+    OlapTable olap_table = 2;
+  }
+}
+
+message IcebergTable {
+  string catalog = 1;
+  string database = 2;
+  string table = 3;
+}
+
+message OlapTable {
+  string instance = 1;
+  string database = 2;
+  string table = 3;
+}
+```
+
+## 11. Master Module Map and Package Layout
+
+The Master codebase is organized into a domain-oriented package structure that balances separation of concerns with low cognitive overhead. The layout distinguishes between core business logic, foundational platform services, and transport handling.
+
+| Package Path            | Category        | Responsibility                                                                                                                                                               |
+| ----------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cmd/master`            | Application     | The binary entry point; responsible for initializing and running the application.                                                                                              |
+| `internal/master`       | **Business Logic** | The core of the control plane. Contains the primary logic for `admission`, `assignment`, and `cluster` management (worker tracking). This package is what makes the Master a master. |
+| `internal/transport/grpc` | Transport Layer | Implements the gRPC service handlers (`ManagementService`, `ControlPlaneService`), manages the server lifecycle, and handles stream management for worker communication.    |
+| `internal/store`        | **Platform Service** | Provides a simplified, high-level interface over the `etcd` client for KV, lease, leader election, and transaction operations. It serves all needs related to cluster state and configuration. |
+| `internal/catalog`      | **Platform Service** | Abstracts clients for interacting with external metadata sources (e.g., Iceberg catalogs). Used by the admission logic to resolve logical requests into physical data plans. |
+| `internal/platform/*`   | **Platform Services** | A collection of truly generic, application-agnostic building blocks. Initially contains `observability` (metrics, logging) and `security` (mTLS, auth).                  |
+| `internal/api/v1`       | API Definitions | Contains the generated Protobuf code, defining the service contracts.                                                                                                         |
+
+
+### High-Level System Diagram (Revised)
+
+```mermaid
+graph TD
+    subgraph Application
+        A["cmd/master"]
+    end
+
+    subgraph Business Logic
+        B["internal/master\n- Admission Control\n- Load Planning\n- Assignment\n- Worker Liveness"]
+    end
+
+    subgraph Transport
+        C["internal/transport/grpc\n- ManagementService\n- ControlPlaneService"]
+    end
+    
+    subgraph Platform Services
+        D["internal/store\n(etcd client)"]
+        E["internal/catalog\n(Iceberg/OLAP client)"]
+        F["internal/platform/observability"]
+        G["internal/platform/security"]
+    end
+
+    subgraph API
+        H["internal/api/v1"]
+    end
+
+    A --> B
+    C --> B
+    B --> D
+    B --> E
+    B --> F
+    B --> G
+    C -- uses --> H
+    B -- uses --> H
+```
+
+## 12. Core Abstractions and Design Philosophy
+
+This revised design significantly reduces the number of core abstractions, favoring concrete implementations until an abstraction is clearly warranted. This approach reduces complexity, minimizes boilerplate, and improves traceability.
+
+### Retained Abstractions (Interfaces)
+
+1.  **`catalog.Connector`**:
+    *   **Description:** An interface within the `internal/catalog` package that abstracts interactions with a specific type of external metadata source.
+    *   **Justification:** This is the primary extension point for supporting new data sources (e.g., OLAP databases) without changing the core admission logic in `internal/master`.
+
+2.  **`master.AssignmentStrategy`**:
+    *   **Description:** An interface within the `internal/master` package that defines `Select(plan LoadPlan, candidates []WorkerInfo) ([]Assignment, error)`, enabling pluggable placement policies.
+    *   **Justification:** Worker selection and data placement logic is a natural point of extension and evolution (e.g., from round-robin to capacity-aware).
+
+3.  **`observability.AuditLogger`**:
+    *   **Description:** An interface within `internal/platform/observability` for emitting append-only audit events for admissions, assignments, and failovers.
+    *   **Justification:** Auditing is a distinct, cross-cutting concern. An interface allows the backend to be changed (e.g., from a log file to a dedicated service) without impacting business logic.
+
+### Eliminated Abstractions (Now Concrete Implementations)
+
+-   **Leader Election:** Handled by a concrete implementation within the `internal/store` package, wrapping the `etcd` client library.
+-   **Worker Liveness & Directory:** Managed directly within `internal/master` by using the `internal/store` to watch `etcd` leases and keys.
+-   **Admission Workflow:** These steps (validation, planning, quotas) are now concrete functions within the `internal/master` package.
+-   **Worker Event Streaming:** Replaced by a concrete `StreamRegistry` within `internal/transport/grpc` to manage active worker connections.
+-   **Configuration & Quota Management:** Handled by direct calls to the `internal/store`, which reads the required data from `etcd`.
+
+## 13. Etcd Key Organization
 
 A well-defined `etcd` key structure is critical for discoverability, atomic operations, and efficient watches. We adopt a hierarchical, tenant-aware key schema.
 
@@ -358,253 +566,7 @@ A well-defined `etcd` key structure is critical for discoverability, atomic oper
 -   `/tenants/{tenant_id}`: Stores all configuration and metadata for a specific tenant, such as resource quotas and source definitions.
 -   `/config/global`: For cluster-wide settings.
 
-## 10. gRPC Protocols
-
-gRPC is the communication backbone for the system. Two primary services are defined:
--   `ControlPlaneService`: For internal, real-time communication between the Master and Workers.
--   `ManagementService`: For external, administrative control over the Master.
-
-### `control_plane_service.proto`
-
-```protobuf
-syntax = "proto3";
-
-package speedlayer.v1;
-
-option go_package = "github.com/leibrix/speedlayer/api/v1";
-
-// ControlPlaneService defines the single, persistent stream for all
-// Master-Worker communication.
-service ControlPlaneService {
-  // EventStream is a long-lived, bidirectional stream. The first message from
-  // a worker MUST be a RegisterEvent.
-  rpc EventStream(stream EventStreamMessage) returns (stream EventStreamMessage);
-}
-
-// EventStreamMessage is the union type for all messages exchanged
-// between the Master and a Worker.
-message EventStreamMessage {
-  // A unique identifier for the event, used for logging and correlation.
-  string event_id = 1;
-  // Tenant and Worker IDs provide context for the event.
-  string tenant_id = 2;
-  string worker_id = 3;
-
-  oneof payload {
-    // ---- Events initiated by the Worker ----
-
-    // Sent once by the worker upon connecting to register itself.
-    RegisterEvent register_event = 4;
-    // Sent periodically by the worker to signal liveness.
-    HeartbeatEvent heartbeat_event = 5;
-    // Sent by the worker to update the master on the status of a data pull.
-    DataPullStatusUpdateEvent data_pull_status_update = 6;
-
-    // ---- Events initiated by the Master ----
-
-    // Sent in response to a successful RegisterEvent.
-    RegistrationAckEvent registration_ack = 7;
-    // Sent to a specific worker to instruct it to pull a data epoch.
-    DataAssignmentEvent data_assignment = 8;
-    // Sent in response to a HeartbeatEvent, can also carry commands.
-    HeartbeatAckEvent heartbeat_ack = 9;
-  }
-}
-
-// --- Worker -> Master Event Payloads ---
-
-message RegisterEvent {
-  // The gRPC address the Master can use to reach this worker if needed
-  // (though communication is primarily over this stream).
-  string address = 1;
-  WorkerCapacity capacity = 2;
-}
-
-message HeartbeatEvent {
-  // Current resource utilization on the worker.
-  ResourceStatus status = 1;
-}
-
-message DataPullStatusUpdateEvent {
-  string dataset_id = 1;
-  string epoch_id = 2;
-  enum Status {
-    UNKNOWN = 0;
-    IN_PROGRESS = 1;
-    COMPLETED = 2;
-    FAILED = 3;
-  }
-  Status status = 3;
-  string error_message = 4; // Populated if status is FAILED.
-}
-
-// --- Master -> Worker Event Payloads ---
-
-message RegistrationAckEvent {
-  // The interval in seconds at which the worker should send heartbeats.
-  int32 heartbeat_interval_seconds = 1;
-}
-
-message DataAssignmentEvent {
-  string dataset_id = 1;
-  string epoch_id = 2;
-  // A structured plan describing where to get the data and how to load it.
-  LoadPlan load_plan = 3;
-}
-
-message HeartbeatAckEvent {
-  // The master can use this to instruct the worker to take action.
-  enum Action {
-    NONE = 0;
-    DRAIN = 1; // Stop accepting new queries and prepare for shutdown.
-  }
-  Action requested_action = 1;
-}
-
-// --- Common Sub-Messages ---
-
-message WorkerCapacity {
-  int64 memory_bytes = 1;
-  int32 cpu_cores = 2;
-}
-
-message ResourceStatus {
-  int64 memory_used_bytes = 1;
-  float cpu_load_avg_5m = 2;
-}
-
-message LoadPlan {
-  // A unique identifier for this loading task, correlating to a specific epoch.
-  string plan_id = 1;
-
-  // The specific data source this plan targets.
-  DataSource source = 2;
-
-  // The name of the table as it should be created or replaced in the worker's
-  // in-memory database (e.g., DuckDB).
-  string destination_table_name = 3;
-
-  // The schema for the data being loaded, serialized as an Arrow IPC schema.
-  bytes arrow_schema = 4;
-}
-
-message DataSource {
-  oneof source_type {
-    IcebergSource iceberg = 1;
-    OlapSource olap = 2;
-  }
-}
-
-message IcebergSource {
-  string table_name = 1;
-  string snapshot_id = 2;
-  // The concrete set of physical data files to be loaded by the worker.
-  // This is resolved by the master's admission controller from the manifest.
-  repeated DataFile files = 3;
-}
-
-message OlapSource {
-  // Data Source Name (DSN) for the worker to connect to the OLAP source.
-  string dsn = 1;
-  // The exact, executable query to generate the data snapshot.
-  // This is constructed by the Master's Admission Controller.
-  string snapshot_query = 2;
-
-  // --- The following fields provide logical context for the worker ---
-  // They can be used for logging, metrics, or schema validation.
-  string catalog = 3;
-  string database = 4;
-  string table = 5;
-  // The specific partition that this query targets.
-  map<string, string> partition_spec = 6;
-}
-
-message DataFile {
-  // The fully qualified URI to the data file (e.g., "s3://bucket/path/file.parquet").
-  string uri = 1;
-  // The format of the file.
-  string format = 2; // "parquet", "orc", etc.
-  // The size of the file in bytes, useful for scheduling and capacity management.
-  int64 size_bytes = 3;
-  // Partition values associated with this file.
-  map<string, string> partition_values = 4;
-}
-```
-
-### `management_service.proto`
-
-```protobuf
-syntax = "proto3";
-
-package speedlayer.v1;
-
-option go_package = "github.com/leibrix/speedlayer/api/v1";
-
-// ManagementService provides an external API for controlling the speed layer.
-// This is the primary entry point for the Admission Controller logic.
-service ManagementService {
-  // AdmitDataset instructs the Master to load a specific dataset, or a partition
-  // of it, into the speed layer. The Master will resolve this logical request
-  // into a concrete LoadPlan and assign it to workers.
-  rpc AdmitDataset(AdmitDatasetRequest) returns (AdmitDatasetResponse);
-}
-
-message AdmitDatasetRequest {
-  string tenant_id = 1;
-  // A user-defined name for this dataset, used for tracking and identification.
-  string dataset_id = 2;
-
-  // A list of specific partitions to load. If empty, the latest snapshot or
-  // the entire table may be loaded, depending on the source type.
-  repeated PartitionSpec partitions_to_load = 3;
-
-  // Information about the source table.
-  DataSourceIdentifier source = 4;
-}
-
-message AdmitDatasetResponse {
-  // A unique identifier for the data epoch that will be created for this request.
-  string epoch_id = 1;
-  // A message indicating that the admission request is being processed.
-  string message = 2;
-}
-
-message PartitionSpec {
-  // A key-value representation of the partition to load.
-  // Example: {"date": "2025-10-12", "country": "US"}
-  map<string, string> values = 1;
-}
-
-message DataSourceIdentifier {
-   oneof source_type {
-    IcebergTable iceberg_table = 1;
-    OlapTable olap_table = 2;
-  }
-}
-
-message IcebergTable {
-  string catalog = 1;
-  string database = 2;
-  string table = 3;
-}
-
-message OlapTable {
-  string instance = 1;
-  string database = 2;
-  string table = 3;
-}
-```
-
-## 11. Multi-Tenancy Support
-
-Multi-tenancy is a first-class citizen in the architecture, enforced at multiple levels by the Master. The central principle is that **a Worker belongs exclusively to one Tenant at a time**. This ensures strict resource isolation.
-
--   **Data Isolation**: All data assignments in `etcd` are namespaced by `tenant_id`, making it impossible for one tenant's configuration to affect another.
--   **Resource Quotas**: Tenant configurations stored under `/tenants/{tenant_id}/config` define hard limits on resources (e.g., total memory, CPU cores). The Master's assignment logic respects these quotas, refusing to assign new data epochs if a tenant would exceed its allocation.
--   **Worker Allocation**: A tenant is mapped to a pool of one or more workers. The `tenant_id` is a mandatory field in the worker's initial `RegisterEvent` and is used to scope its key in `etcd` (`/workers/{tenant_id}/{worker_id}`). This prevents cross-tenant data assignments.
--   **gRPC Stream Context**: The `tenant_id` is present in every `EventStreamMessage`, ensuring that all communication is correctly scoped and authorized. The Master's gRPC handler will validate that the worker is registered to the tenant it claims to represent.
-
-## 12. Additional Details
+## 14. Additional Details
 
 ### Configuration Management
 
@@ -613,44 +575,9 @@ Multi-tenancy is a first-class citizen in the architecture, enforced at multiple
 
 ### Logging and Monitoring
 
--   **Logging**: The Master will use a structured logging library like `uber-go/zap`. Logs will be written as JSON and include contextual fields like `tenant_id`, `worker_id`, and `trace_id` to facilitate debugging in a distributed environment.
+-   **Logging**: The Master will use a structured logging library like `uber-go/zap`. Logs will be written as JSON and include contextual fields like `tenant_id`, `worker_id`, and `trace_id`.
 -   **Monitoring**: The Master will expose key metrics in a Prometheus-compatible format.
     -   `master_leader_status`: 1 if the current node is leader, 0 otherwise.
     -   `master_workers_registered_total`: A gauge of healthy workers per tenant.
     -   `master_data_assignment_duration_seconds`: A histogram of time taken to assign data.
     -   `etcd_client_latency_seconds`: Latency for `etcd` operations.
-
-These interfaces keep the Master extensible. For example, swapping the `AssignmentStrategy` or adding a new catalog connector only requires wiring in a new implementation without touching the core orchestration loop. Similarly, isolating the gRPC event handling behind `EventSink` allows unit testing of scheduling logic without standing up real streams.
-
-### Sample YAML Configuration (for a Master node's bootstrap)
-
-```yaml
-# master-config.yaml
-# Used for initial startup before connecting to etcd.
-
-# Unique identifier for this master node.
-master_id: "master-node-01"
-
-# Etcd client configuration.
-etcd:
-  endpoints: ["10.0.1.10:2379", "10.0.1.11:2379", "10.0.1.12:2379"]
-  # TLS for etcd connection can be configured here.
-  # tls:
-  #   cert_file: "/etc/master/tls/etcd.crt"
-  #   key_file: "/etc/master/tls/etcd.key"
-  #   ca_file: "/etc/master/tls/etcd-ca.crt"
-
-# gRPC server configuration for listening to Workers.
-grpc_server:
-  listen_address: "0.0.0.0:9090"
-  # mTLS for the gRPC server will be configured here later.
-  # tls:
-  #   cert_file: "/etc/master/tls/grpc.crt"
-  #   key_file: "/etc/master/tls/grpc.key"
-  #   ca_file: "/etc/master/tls/tenant-ca.crt"
-
-# Logging configuration.
-logging:
-  level: "info" # Can be overridden by global config in etcd.
-  format: "json"
-```
