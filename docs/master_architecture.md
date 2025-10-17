@@ -11,140 +11,126 @@ The key changes focus on:
 ## 2. Overall Architecture Diagram
 
 ```mermaid
-graph TB
-    %% External Layer - Clients
-    subgraph External["🌐 External Systems & Clients"]
-        direction LR
-        Admin["👤 Admin/Controller<br/>Management Interface"]
-        BI["📊 BI Tools<br/>Query Clients"]
-    end
-
-    %% Application Layer - Gateway
-    subgraph AppLayer["📡 Application Layer - Query Gateway"]
-        direction LR
-        Gateway["Data Gateway<br/>• Query Routing<br/>• Load Balancing<br/>• Failover"]
-    end
-
-    %% Control Plane - Master Cluster
-    subgraph ControlPlane["🎯 Control Plane - Master Cluster"]
+graph TD
+    %% Top Layer - External Clients and Integrations
+    subgraph Layer1["Layer 1 · External Interfaces"]
         direction TB
-        
-        subgraph MasterNodes["Master Nodes (HA Cluster)"]
-            direction LR
-            M1["Master-1<br/>Follower"]
-            M2["Master-2<br/>⭐ Leader"]
-            M3["Master-3<br/>Follower"]
-        end
-        
-        subgraph MasterComponents["Leader Components"]
-            direction TB
-            
-            subgraph API["gRPC API Layer"]
-                MgmtAPI["ManagementService<br/>• AdmitDataset<br/>• ListDatasets"]
-                CtrlAPI["ControlPlaneService<br/>• EventStream<br/>• Worker Coordination"]
-            end
-            
-            subgraph CoreLogic["Core Business Logic"]
-                Admission["Admission Controller<br/>• Request Validation<br/>• Source Interrogation<br/>• LoadPlan Generation<br/>• Quota Enforcement"]
-                Assignment["Assignment Manager<br/>• Worker Selection<br/>• Load Balancing<br/>• Rebalancing"]
-                Cluster["Cluster Manager<br/>• Worker Liveness<br/>• Health Monitoring<br/>• Failover Detection"]
-            end
-            
-            API --> CoreLogic
-        end
-        
-        subgraph StateStore["Distributed State Store"]
-            Etcd["etcd Cluster<br/>• Leader Election (RAFT)<br/>• Worker Registry<br/>• Assignment State<br/>• Tenant Config<br/>• Global Config"]
-        end
-        
-        MasterNodes --> StateStore
-        CoreLogic --> StateStore
+        Admin["👤 Admin Console<br/>• Dataset Admission<br/>• Operational Overrides"]
+        BIClients["📊 Analytics Clients<br/>• BI Tools<br/>• Partner Apps"]
+        Observability["🛰️ Observability Stack<br/>• Alerting<br/>• Dashboards"]
     end
 
-    %% Data Plane - Workers
-    subgraph DataPlane["⚡ Data Plane - Worker Cluster"]
+    %% Layer 2 - Data Gateway / API Edge
+    subgraph Layer2["Layer 2 · Data Gateway"]
         direction TB
-        
-        subgraph TenantA["Tenant A Workers"]
+        Gateway["📡 Data Gateway<br/>• Query Routing<br/>• Tenant Isolation<br/>• Result Aggregation"]
+        GatewayCache["Assignment Cache<br/>• etcd Watchers<br/>• Routing Tables"]
+    end
+
+    %% Layer 3 - Master Control Plane
+    subgraph Layer3["Layer 3 · Master Control Plane"]
+        direction TB
+
+        subgraph MasterCluster["HA Master Cluster"]
             direction LR
-            W1["Worker-1<br/>🔷 DuckDB Engine<br/>📦 Epoch Cache<br/>💾 In-Memory Data"]
-            W2["Worker-2<br/>🔷 DuckDB Engine<br/>📦 Epoch Cache<br/>💾 In-Memory Data"]
+            MasterLeader["⭐ Leader"]
+            MasterFollower1["Follower"]
+            MasterFollower2["Follower"]
         end
-        
-        subgraph TenantB["Tenant B Workers"]
-            direction LR
-            W3["Worker-3<br/>🔷 DuckDB Engine<br/>📦 Epoch Cache<br/>💾 In-Memory Data"]
-            W4["Worker-N<br/>🔷 DuckDB Engine<br/>📦 Epoch Cache<br/>💾 In-Memory Data"]
+
+        subgraph MasterAPIs["gRPC & Event APIs"]
+            MgmtService["ManagementService<br/>• AdmitDataset<br/>• DatasetStatus"]
+            ControlService["ControlPlaneService<br/>• WorkerStream<br/>• AssignmentBroadcast"]
+        end
+
+        subgraph MasterLogic["Core Coordination Modules"]
+            AdmissionCtrl["Admission Controller<br/>• Request Validation<br/>• LoadPlan Assembly"]
+            AssignmentMgr["Assignment Manager<br/>• Worker Selection<br/>• Rebalance Policies"]
+            EpochLifecycle["Epoch Lifecycle<br/>• TTL & Eviction<br/>• Refresh Scheduling"]
+            ClusterHealth["Cluster Health<br/>• Worker Liveness<br/>• Retry Policies"]
+        end
+
+        subgraph MasterState["Shared State & Metadata"]
+            Etcd["etcd<br/>• Leader Election<br/>• Assignment Registry<br/>• Worker Registry"]
+            MetadataCache["Metadata Cache<br/>• Dataset Specs<br/>• Security Policies"]
         end
     end
 
-    %% Infrastructure Layer - Data Sources
-    subgraph Infrastructure["🗄️ Infrastructure Layer - Data Sources"]
-        direction LR
-        
-        subgraph Lakehouse["Data Lakehouse"]
-            Iceberg["Apache Iceberg<br/>• Table Format<br/>• Metadata Catalog<br/>• Snapshot Management"]
+    %% Layer 4 - Worker Data Plane
+    subgraph Layer4["Layer 4 · Worker Data Plane"]
+        direction TB
+
+        subgraph WorkerFleet["Worker Pool"]
+            direction LR
+            WorkerA["Worker A<br/>• DuckDB Runtime<br/>• Epoch Cache"]
+            WorkerB["Worker B<br/>• DuckDB Runtime<br/>• Epoch Cache"]
+            WorkerN["Worker N<br/>• DuckDB Runtime<br/>• Epoch Cache"]
         end
-        
-        subgraph OLAP["OLAP Systems"]
-            StarRocks["StarRocks<br/>• Analytical Engine<br/>• Query Processing<br/>• Data Snapshots"]
+
+        subgraph WorkerServices["Worker Services"]
+            WorkerAgent["Control Agent<br/>• Register & Heartbeat<br/>• Assignment Execution"]
+            DataLoader["Data Loader<br/>• Snapshot Download<br/>• Compaction Hooks"]
+            QueryServe["Query Surface<br/>• Vector Execution<br/>• Result Serving"]
         end
     end
 
-    %% Connections - Control Flow
-    Admin -->|"1. AdmitDataset RPC"| MgmtAPI
-    MgmtAPI --> Admission
-    Admission -->|"2. Resolve Metadata"| Iceberg
-    Admission -->|"2. Resolve Metadata"| StarRocks
-    Admission --> Assignment
-    Assignment -->|"3. Persist Assignment"| Etcd
-    
-    %% Connections - Worker Management
-    CtrlAPI <-->|"4. Bi-directional Stream<br/>Register/Heartbeat/Assignment"| W1
-    CtrlAPI <-->|"4. Bi-directional Stream<br/>Register/Heartbeat/Assignment"| W2
-    CtrlAPI <-->|"4. Bi-directional Stream<br/>Register/Heartbeat/Assignment"| W3
-    CtrlAPI <-->|"4. Bi-directional Stream<br/>Register/Heartbeat/Assignment"| W4
-    
-    Cluster -->|"5. Monitor Leases"| Etcd
-    
-    %% Connections - Data Pull
-    W1 -.->|"6. Pull Data Files"| Iceberg
-    W2 -.->|"6. Pull Data Files"| Iceberg
-    W3 -.->|"6. Pull Query Results"| StarRocks
-    W4 -.->|"6. Pull Query Results"| StarRocks
-    
-    %% Connections - Query Flow
-    BI -->|"7. Query Request"| Gateway
-    Gateway -->|"8. Lookup Assignment"| Etcd
-    Gateway -->|"9. Route Query"| W1
-    Gateway -->|"9. Route Query"| W2
-    Gateway -->|"9. Route Query"| W3
-    Gateway -->|"9. Route Query"| W4
+    %% Bottom Layer - Foundational Systems
+    subgraph Layer5["Layer 5 · Foundational Systems"]
+        direction TB
+        StarRocks["🧱 StarRocks<br/>• OLAP Engine<br/>• Materialized Views"]
+        Lakehouse["💾 Lakehouse (Apache Iceberg)<br/>• Object Storage<br/>• Table Metadata"]
+        Secrets["🔐 Security & Secrets<br/>• PKI / mTLS<br/>• IAM Federation"]
+        Infra["☁️ Cloud Infra<br/>• Kubernetes<br/>• Object Storage<br/>• Networking"]
+    end
 
-    %% Styling for Dark Mode - High Contrast
-    classDef external fill:#4a5568,stroke:#e2e8f0,stroke-width:3px,color:#f7fafc
-    classDef appLayer fill:#2d3748,stroke:#90cdf4,stroke-width:3px,color:#e6fffa
-    classDef controlPlane fill:#1a365d,stroke:#63b3ed,stroke-width:3px,color:#bee3f8
-    classDef masterNode fill:#2c5282,stroke:#90cdf4,stroke-width:2px,color:#e6fffa
-    classDef api fill:#2a4365,stroke:#4299e1,stroke-width:2px,color:#bee3f8
-    classDef logic fill:#1e4e8c,stroke:#4299e1,stroke-width:2px,color:#bee3f8
-    classDef state fill:#234e52,stroke:#4fd1c5,stroke-width:3px,color:#b2f5ea
-    classDef dataPlane fill:#22543d,stroke:#68d391,stroke-width:3px,color:#c6f6d5
-    classDef worker fill:#276749,stroke:#68d391,stroke-width:2px,color:#c6f6d5
-    classDef infrastructure fill:#742a2a,stroke:#fc8181,stroke-width:3px,color:#fed7d7
-    classDef dataSource fill:#9b2c2c,stroke:#fc8181,stroke-width:2px,color:#fed7d7
+    %% Cross-layer Interactions
+    Admin --> MgmtService
+    BIClients --> Gateway
+    Observability -->|"Telemetry"| MasterLogic
+    Observability -->|"Metrics"| WorkerServices
 
-    class External external
-    class AppLayer,Gateway appLayer
-    class ControlPlane,MasterNodes,MasterComponents,API,CoreLogic controlPlane
-    class M1,M2,M3 masterNode
-    class MgmtAPI,CtrlAPI api
-    class Admission,Assignment,Cluster logic
-    class StateStore,Etcd state
-    class DataPlane,TenantA,TenantB dataPlane
-    class W1,W2,W3,W4 worker
-    class Infrastructure,Lakehouse,OLAP infrastructure
-    class Iceberg,StarRocks dataSource
+    Gateway --> GatewayCache
+    GatewayCache --> Etcd
+    Gateway --> WorkerA
+    Gateway --> WorkerB
+    Gateway --> WorkerN
+
+    MgmtService --> AdmissionCtrl
+    ControlService --> WorkerAgent
+    AdmissionCtrl --> MetadataCache
+    AdmissionCtrl --> Lakehouse
+    AdmissionCtrl --> StarRocks
+    AssignmentMgr --> Etcd
+    AssignmentMgr --> WorkerAgent
+    EpochLifecycle --> WorkerAgent
+    ClusterHealth --> Etcd
+    ClusterHealth --> WorkerAgent
+
+    WorkerAgent --> WorkerServices
+    WorkerServices --> StarRocks
+    WorkerServices --> Lakehouse
+
+    MasterCluster --> Etcd
+    MasterAPIs --> MasterLogic
+    MasterLogic --> MasterState
+
+    %% Dark Mode Styling
+    classDef layer1 fill:#1e293b,stroke:#38bdf8,stroke-width:3px,color:#f8fafc
+    classDef layer2 fill:#0f172a,stroke:#f97316,stroke-width:3px,color:#f8fafc
+    classDef layer3 fill:#111827,stroke:#22d3ee,stroke-width:3px,color:#ecfeff
+    classDef layer4 fill:#052e16,stroke:#4ade80,stroke-width:3px,color:#dcfce7
+    classDef layer5 fill:#312e81,stroke:#c084fc,stroke-width:3px,color:#ede9fe
+    classDef internal fill:#1f2937,stroke:#94a3b8,stroke-width:2px,color:#e2e8f0
+    classDef storage fill:#1f1b4d,stroke:#facc15,stroke-width:2px,color:#fef3c7
+
+    class Layer1 layer1
+    class Admin,BIClients,Observability internal
+    class Layer2,Gateway,GatewayCache layer2
+    class Layer3,MasterCluster,MasterAPIs,MasterLogic,MasterState layer3
+    class MasterLeader,MasterFollower1,MasterFollower2,MgmtService,ControlService,AdmissionCtrl,AssignmentMgr,EpochLifecycle,ClusterHealth,Etcd,MetadataCache internal
+    class Layer4,WorkerFleet,WorkerServices,WorkerA,WorkerB,WorkerN,WorkerAgent,DataLoader,QueryServe layer4
+    class Layer5,StarRocks,Lakehouse,Secrets,Infra layer5
+    class StarRocks,Lakehouse storage
 ```
 
 ## 3. Overall Architecture
