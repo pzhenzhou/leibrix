@@ -13,7 +13,6 @@ import (
 	"github.com/pzhenzhou/leibri.io/pkg/common"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	concurrencyv3 "go.etcd.io/etcd/client/v3/concurrency"
-	"go.uber.org/zap"
 )
 
 const (
@@ -40,17 +39,12 @@ type MemberNode struct {
 	Role          MemberRole `json:"-"`
 }
 
-type Listener interface {
-	// OnLeaderChange called when leader is elected/resigned/expired
-	OnLeaderChange(ev LeaderEvent)
-	// OnMembershipChange called when member joined/left/expired/updated
-	OnMembershipChange(ev MembershipEvent)
-}
-
 type sink struct {
 	ch   chan any
 	once sync.Once
 }
+
+var logger = common.InitLogger()
 
 type LeibrixLeaderElection struct {
 	config    *conf.MasterConfig
@@ -70,24 +64,23 @@ type LeibrixLeaderElection struct {
 
 	lock           sync.Mutex
 	nextListenerID uint64
-	logger         *zap.Logger
+	//logger         *zap.Logger
 }
 
 func NewLeaderElection(config *conf.MasterConfig) (*LeibrixLeaderElection, error) {
-	logger, err := common.BuildZapLogger()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build logger for leader election: %w", err)
-	}
 
+	innerLogger, initLoggerErr := common.BuildZapLogger()
+	if initLoggerErr != nil {
+		panic(initLoggerErr)
+	}
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints: config.Endpoints,
-		Logger:    logger,
+		Logger:    innerLogger,
 	})
 	if err != nil {
-		logger.Error("failed to create etcd client", zap.Error(err))
-		return nil, err
+		logger.Error(err, "Failed to create etcd client", "node", config.MasterNode.NodeName)
+		panic(err)
 	}
-
 	node := &MemberNode{
 		Name:          config.MasterNode.NodeName,
 		Role:          Candidate, // Start as a candidate
@@ -100,23 +93,22 @@ func NewLeaderElection(config *conf.MasterConfig) (*LeibrixLeaderElection, error
 		client:    cli,
 		myNode:    node,
 		listeners: make(map[uint64]*sink),
-		logger:    logger.Named("leader-election"),
 	}, nil
 }
 
 func (l *LeibrixLeaderElection) Start(ctx context.Context) error {
-	l.logger.Info("starting leader election service", zap.String("node", l.myNode.Name))
+	logger.Info("starting leader election service", "node", l.myNode.Name)
 	session, err := concurrencyv3.NewSession(l.client, concurrencyv3.WithTTL(sessionTTL))
 	if err != nil {
-		l.logger.Error("failed to create etcd session", zap.Error(err))
+		logger.Error(err, fmt.Sprintf("failed to create etcd session for leader election service: %s", l.myNode.Name))
 		return err
 	}
 	l.session = session
 	l.election = concurrencyv3.NewElection(session, electionKey)
 
-	if err := l.registerMember(ctx); err != nil {
-		l.logger.Error("failed to register member", zap.Error(err))
-		return err
+	if registerErr := l.registerMember(ctx); registerErr != nil {
+		logger.Error(registerErr, fmt.Sprintf("failed to register leader election service: %s", l.myNode.Name))
+		return registerErr
 	}
 
 	parentCtx, cancel := context.WithCancel(ctx)
@@ -131,12 +123,12 @@ func (l *LeibrixLeaderElection) Start(ctx context.Context) error {
 	l.wg.Add(1)
 	go l.observeMembers(parentCtx)
 
-	l.logger.Info("leader election service started", zap.String("node", l.myNode.Name))
+	logger.Info("leader election service started", "node", l.myNode.Name)
 	return nil
 }
 
 func (l *LeibrixLeaderElection) Close() error {
-	l.logger.Info("stopping leader election service", zap.String("node", l.myNode.Name))
+	logger.Info("stopping leader election service", "node", l.myNode.Name)
 
 	// Check if cancel was initialized before calling
 	// cancel is only set in Start(), so Close() before Start() would cause panic
@@ -150,24 +142,24 @@ func (l *LeibrixLeaderElection) Close() error {
 	//   2. The member key (/leibri.io/cluster/members/{node_name})
 	// Both keys were registered with the same session lease, ensuring atomic cleanup.
 	if l.session != nil {
-		if err := l.session.Close(); err != nil {
-			l.logger.Warn("failed to close etcd session", zap.Error(err))
+		if sessionCloseErr := l.session.Close(); sessionCloseErr != nil {
+			logger.Error(sessionCloseErr, fmt.Sprintf("failed to close session for leader election service: %s", l.myNode.Name))
 		} else {
-			l.logger.Debug("session closed, lease automatically revoked")
+			logger.Info("session closed, lease automatically revoked", "node", l.myNode.Name)
 		}
 	}
 
-	l.logger.Info("leader election service stopped")
+	logger.Info("leader election service stopped")
 	return l.client.Close()
 }
 
 func (l *LeibrixLeaderElection) registerMember(ctx context.Context) error {
-	l.logger.Info("registering cluster member with election session")
+	logger.Info("registering cluster member with election session")
 
 	// Marshal member information
 	memberJSON, err := json.Marshal(l.myNode)
 	if err != nil {
-		l.logger.Error("failed to marshal member data", zap.Error(err))
+		logger.Error(err, fmt.Sprintf("failed to marshal leader election session for member %s", l.myNode.Name))
 		return fmt.Errorf("failed to marshal member data: %w", err)
 	}
 
@@ -181,16 +173,16 @@ func (l *LeibrixLeaderElection) registerMember(ctx context.Context) error {
 	//   2. The member key is automatically removed
 	// This prevents split-brain scenarios where a node appears as a member
 	// but has lost its leadership session.
-	_, err = l.client.Put(ctx, memberKey, string(memberJSON),
+	_, putErr := l.client.Put(ctx, memberKey, string(memberJSON),
 		clientv3.WithLease(l.session.Lease()))
-	if err != nil {
-		l.logger.Error("failed to register member in etcd", zap.Error(err))
-		return fmt.Errorf("failed to register member: %w", err)
+	if putErr != nil {
+		logger.Error(putErr, fmt.Sprintf("failed to register member %s", l.myNode.Name))
+		return fmt.Errorf("failed to register member: %w", putErr)
 	}
 
-	l.logger.Info("member registered successfully with session lease",
-		zap.String("key", memberKey),
-		zap.String("lease_id", fmt.Sprintf("%x", l.session.Lease())))
+	logger.Info("member registered successfully with session lease",
+		"key", memberKey,
+		"lease_id", fmt.Sprintf("%x", l.session.Lease()))
 
 	return nil
 }
@@ -206,7 +198,7 @@ func (l *LeibrixLeaderElection) observeMembers(ctx context.Context) {
 
 	for resp := range watchChan {
 		for _, event := range resp.Events {
-			var eventType MembershipEventType
+			var eventType EventType
 			var member MemberNode
 
 			key := event.Kv.Key
@@ -215,19 +207,19 @@ func (l *LeibrixLeaderElection) observeMembers(ctx context.Context) {
 			switch event.Type {
 			case clientv3.EventTypePut:
 				if event.IsCreate() {
-					eventType = MemberJoined
+					eventType = EvtMemberJoined
 				} else {
-					eventType = MemberUpdated
+					eventType = EvtMemberUpdated
 				}
 			case clientv3.EventTypeDelete:
-				eventType = MemberLeft
+				eventType = EvtMemberLeft
 				// For deletes, the value is gone, so we must use the previous value.
 				value = event.PrevKv.Value
 				key = event.PrevKv.Key
 			}
 
 			if err := json.Unmarshal(value, &member); err != nil {
-				l.logger.Warn("failed to unmarshal member data for event", zap.Error(err), zap.ByteString("key", key))
+				logger.Error(err, "failed to unmarshal member data", "node", l.myNode.Name)
 				continue
 			}
 			// Fallback to key if name is not in value
@@ -251,12 +243,12 @@ func (l *LeibrixLeaderElection) broadcastLeaderEvent(ev LeaderEvent) {
 	}
 	l.lock.Unlock()
 
-	l.logger.Debug("broadcasting leader event", zap.String("type", string(ev.Type)), zap.String("leader", ev.Member.Name))
+	logger.Info("broadcasting leader event", "type", string(ev.Type), "leader", ev.Member.Name)
 	for _, s := range sinksToNotify {
 		select {
 		case s.ch <- ev:
 		default:
-			l.logger.Warn("listener channel full, dropping leader event")
+			logger.Info("listener channel full, dropping leader event")
 		}
 	}
 }
@@ -269,12 +261,12 @@ func (l *LeibrixLeaderElection) broadcastMembershipEvent(ev MembershipEvent) {
 	}
 	l.lock.Unlock()
 
-	l.logger.Debug("broadcasting membership event", zap.String("type", string(ev.Type)), zap.String("member", ev.Member.Name))
+	logger.Info("broadcasting membership event", "type", string(ev.Type), "member", ev.Member.Name)
 	for _, s := range sinksToNotify {
 		select {
 		case s.ch <- ev:
 		default:
-			l.logger.Warn("listener channel full, dropping membership event")
+			logger.Info("listener channel full, dropping membership event")
 		}
 	}
 }
@@ -293,11 +285,11 @@ func (l *LeibrixLeaderElection) campaign(ctx context.Context) {
 		default:
 		}
 
-		l.logger.Info("campaigning for leadership")
+		logger.Info("campaigning for leadership")
 		leaderCtx, cancel := context.WithCancel(ctx)
 		err := l.election.Campaign(leaderCtx, l.myNode.Name)
 		if err != nil {
-			l.logger.Warn("campaign failed or was cancelled", zap.Error(err))
+			logger.Error(err, fmt.Sprintf("failed to campaign leadership for node %s", l.myNode.Name))
 			cancel()
 			time.Sleep(leaderChangeRetry)
 			continue
@@ -306,14 +298,14 @@ func (l *LeibrixLeaderElection) campaign(ctx context.Context) {
 		// became the leader
 		l.becomeLeader()
 
-		l.logger.Info("successfully elected as leader")
+		logger.Info("successfully elected as leader")
 
 		select {
 		case <-l.session.Done():
-			l.logger.Warn("leader session expired")
+			logger.Info("leader session expired", "node", l.myNode.Name)
 			l.loseLeadership()
 		case <-ctx.Done():
-			l.logger.Info("context cancelled, resigning leadership")
+			logger.Info("context cancelled, resigning leadership", "node", l.myNode.Name)
 		}
 		cancel()
 	}
@@ -331,7 +323,7 @@ func (l *LeibrixLeaderElection) observeLeader(ctx context.Context) {
 		select {
 		case resp, ok := <-ch:
 			if !ok {
-				l.logger.Info("observer channel closed, stopping leader observation")
+				logger.Info("observer channel closed, stopping leader observation")
 				return
 			}
 			if len(resp.Kvs) > 0 {
@@ -344,10 +336,10 @@ func (l *LeibrixLeaderElection) observeLeader(ctx context.Context) {
 				}
 				l.lock.Unlock()
 
-				l.logger.Info("observed new leader", zap.String("leader", leaderName))
+				logger.Info("observed new leader", "leader", leaderName)
 
 				ev := LeaderEvent{
-					Type: LeaderElected,
+					Type: EvtLeaderElected,
 					Member: &MemberNode{
 						Name: leaderName,
 					},
@@ -355,12 +347,12 @@ func (l *LeibrixLeaderElection) observeLeader(ctx context.Context) {
 				}
 				l.broadcastLeaderEvent(ev)
 			} else {
-				l.logger.Info("observed no leader is present")
+				logger.Info("observed no leader is present")
 				// No leader is present, could broadcast a "no leader" event if needed
 			}
 
 		case <-ctx.Done():
-			l.logger.Info("context cancelled, stopping leader observation")
+			logger.Info("context cancelled, stopping leader observation")
 			return
 		}
 	}
@@ -378,7 +370,7 @@ func (l *LeibrixLeaderElection) loseLeadership() {
 	l.myNode.Role = Candidate
 
 	ev := LeaderEvent{
-		Type: LeaderResigned,
+		Type: EvtLeaderResigned,
 		Member: &MemberNode{
 			Name: l.config.MasterNode.NodeName,
 		},
@@ -430,7 +422,7 @@ func (l *LeibrixLeaderElection) Watch(listener Listener) (unwatch func()) {
 func (l *LeibrixLeaderElection) Members() ([]*MemberNode, error) {
 	resp, err := l.client.Get(context.Background(), membersKey, clientv3.WithPrefix())
 	if err != nil {
-		l.logger.Error("failed to get cluster members from etcd", zap.Error(err))
+		logger.Error(err, fmt.Sprintf("failed to get members"), "node", l.myNode.Name)
 		return nil, err
 	}
 
@@ -438,7 +430,7 @@ func (l *LeibrixLeaderElection) Members() ([]*MemberNode, error) {
 	for _, kv := range resp.Kvs {
 		var member MemberNode
 		if err := json.Unmarshal(kv.Value, &member); err != nil {
-			l.logger.Warn("failed to unmarshal member data", zap.Error(err), zap.ByteString("key", kv.Key))
+			logger.Error(err, fmt.Sprintf("failed to unmarshal member"), "node", l.myNode.Name)
 			continue
 		}
 		members = append(members, &member)
