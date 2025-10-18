@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package leibrix_cp;
+import "proto/common.proto";
+option go_package = "github.com/pzhenzhou/leibri.io/pkg/proto";
+
+service ManagementService {
+  // AdmitDataset instructs the Master to load a specific dataset into the speed layer.
+  rpc AdmitDataset(AdmitDatasetRequest) returns (AdmitDatasetResponse);
+}
+
+message AdmitDatasetRequest {
+  string tenant_id = 1;
+  string dataset_id = 2;
+
+  // The core of the request, specifying which data to load using the unified
+  // catalog-centric model.
+  DataSource source = 3;
+}
+
+message AdmitDatasetResponse {
+  string epoch_id = 1;
+  string message = 2;
+}

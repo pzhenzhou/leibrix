@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package leibrix_cp;
+option go_package = "github.com/pzhenzhou/leibri.io/pkg/proto";
+
+
+message DataSource {
+  Catalog catalog = 1;
+  string database = 2;
+  string table = 3;
+  // A generic filter expression (e.g., a SQL WHERE clause) that can be
+  // pushed down to the source to filter data.
+  string filter = 4;
+  // For data sources that support time-travel or versioned snapshots, this
+  // identifies the specific version of the data to be loaded. For Iceberg,
+  // this is a snapshot ID. For OLAP systems, this might be unused.
+  optional string version = 5;
+}
+
+message Catalog {
+  oneof catalog_type {
+    IcebergCatalog iceberg = 1;
+    StarRocksCatalog starrocks = 2;
+    JdbcCatalog jdbc = 3;
+  }
+}
+
+message IcebergCatalog {
+  // The URI of the Iceberg catalog (e.g., a REST catalog URL, a Hive
+  // Metastore URI, or a path to a file-based catalog).
+  string uri = 1;
+}
+
+message StarRocksCatalog {
+  // The connection string (DSN) for the StarRocks cluster's FE service.
+  string dsn = 1;
+  // StarRocks can expose multiple internal catalogs; this specifies which
+  // one to use (e.g., "default_catalog").
+  string internal_catalog_name = 2;
+}
+
+message JdbcCatalog {
+  // The full JDBC connection string.
+  string uri = 1;
+  // The driver class name (e.g., "org.postgresql.Driver").
+  string driver = 2;
+}

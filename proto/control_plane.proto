@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package leibrix_cp;
+
+import "proto/common.proto";
+option go_package = "github.com/pzhenzhou/leibri.io/pkg/proto";
+
+// EventStreamMessage is the union type for all messages exchanged
+// between the Master and a Worker.
+message EventStreamMessage {
+  // A unique identifier for the event, used for logging and correlation.
+  string event_id = 1;
+  // Tenant and Worker IDs provide context for the event.
+  string tenant_id = 2;
+  string worker_id = 3;
+
+  oneof payload {
+    // ---- Events initiated by the Worker ----
+    RegisterEvent register_event = 4;
+    HeartbeatEvent heartbeat_event = 5;
+    DataPullStatusUpdateEvent data_pull_status_update = 6;
+
+    // ---- Events initiated by the Master ----
+    RegistrationAckEvent registration_ack = 7;
+    DataAssignmentEvent data_assignment = 8;
+    HeartbeatAckEvent heartbeat_ack = 9;
+  }
+}
+
+message Worker {
+  string node_id = 1;
+  string addr = 2;
+  map<string, string> labels = 3;
+}
+
+message RegisterEvent {
+  Worker worker = 1;
+}
+
+message HeartbeatEvent {
+}
+
+message DataPullStatusUpdateEvent {
+  string dataset_id = 1;
+  string epoch_id = 2;
+  enum Status {
+    UNKNOWN = 0;
+    IN_PROGRESS = 1;
+    COMPLETED = 2;
+    FAILED = 3;
+  }
+  Status status = 3;
+  string error_message = 4; // Populated if status is FAILED.
+}
+
+message RegistrationAckEvent {
+  int32 heartbeat_interval_seconds = 1;
+}
+
+message DataAssignmentEvent {
+  string dataset_id = 1;
+  string epoch_id = 2;
+  LoadPlan load_plan = 3;
+}
+
+message HeartbeatAckEvent {
+  enum Action {
+    NONE = 0;
+    DRAIN = 1;
+  }
+  Action requested_action = 1;
+}
+
+message LoadPlan {
+  string plan_id = 1;
+  DataSource source = 2;
+  string destination_table_name = 3;
+  bytes arrow_schema = 4;
+}
