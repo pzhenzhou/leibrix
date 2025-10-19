@@ -58,7 +58,6 @@ help: ## Display this help.
 	@echo "  make run ARGS=\"--service-port=8080 --pprof=false\""
 	@echo "  make run-local ARGS=\"--metrics.enable=true\""
 	@echo "  make deploy OVERLAY=prod"
-	@echo "  make deploy-prod IMG=docker-registry.micoworld.net/data-test/leibrix:nightly-20250829"
 	@echo "  make deploy-prod IMG=custom-image:tag REPLICAS=3"
 	@echo "  make k3d-deploy"
 
@@ -138,9 +137,6 @@ docker-build-dev: build ## Build and push docker image for development to k3d re
 	@echo "📋 Push URL: localhost:5001/leibrix:latest"
 	@echo "📋 Cluster URL: $(DEV_IMG)"
 
-.PHONY: docker-buildx-dev
-docker-buildx-dev: docker-build-dev ## Alias for docker-build-dev (for backward compatibility)
-
 ##@ Development
 
 .PHONY: run
@@ -152,11 +148,6 @@ run: build ## Run the built binary locally. Use ARGS="--flag value" to pass argu
 run-dev: build ## Run with development configuration (pprof enabled, metrics enabled).
 	@echo "Running $(BINARY_NAME) in development mode..."
 	./bin/$(BINARY_NAME) --pprof=true --metrics.enable=true
-
-.PHONY: run-with-metrics
-run-with-metrics: build ## Run with metrics enabled.
-	@echo "Running $(BINARY_NAME) with metrics enabled..."
-	./bin/$(BINARY_NAME) --metrics.enable=true --metrics.sink=prometheus
 
 .PHONY: run-local
 run-local: envtest build fmt vet ## Run using go run (for development with hot reload).
@@ -173,17 +164,10 @@ deploy-rbac: kustomize ## Deploy RBAC resources to the K8s cluster specified in 
 	@echo "Deploying RBAC resources..."
 	$(KUSTOMIZE) build config/rbac | kubectl apply -f -
 
-.PHONY: deploy
-deploy: kustomize ## Deploy to the K8s cluster specified in ~/.kube/config. Use OVERLAY=dev|prod to specify environment.
-	@echo "Deploying leibrix to $(OVERLAY) environment..."
-	$(MAKE) create-hive-secret DEST_NAMESPACE=leibrix-system
-	$(KUSTOMIZE) build config/overlays/$(OVERLAY) | kubectl apply -f -
-
 .PHONY: deploy-dev
 deploy-dev: kustomize ## Deploy to development environment.
 	@echo "🚀 Deploying leibrix to development environment..."
 	cd config/overlays/dev && $(KUSTOMIZE) edit set image leibrix=$(DEV_IMG)
-	$(MAKE) create-hive-secret DEST_NAMESPACE=leibrix-system
 	$(KUSTOMIZE) build config/overlays/dev | kubectl apply -f -
 	@echo "✅ Successfully deployed to development environment"
 	@echo "📋 Namespace: leibrix-system"
@@ -194,29 +178,11 @@ deploy-prod: kustomize ## Deploy to production environment. Use IMG=<image> and 
 	@echo "🚀 Deploying leibrix to production environment..."
 	cd config/overlays/prod && $(KUSTOMIZE) edit set image leibrix=$(IMG)
 	cd config/overlays/prod && $(KUSTOMIZE) edit set replicas leibrix=$(REPLICAS)
-	$(MAKE) create-hive-secret DEST_NAMESPACE=leibrix-system
 	$(KUSTOMIZE) build config/overlays/prod | kubectl apply -f -
 	@echo "✅ Successfully deployed to production environment"
 	@echo "📋 Namespace: leibrix-system"
 	@echo "📋 Image: $(IMG)"
 	@echo "📋 Replicas: $(REPLICAS)"
-
-.PHONY: build-and-deploy-dev
-build-and-deploy-dev: docker-buildx-dev deploy-dev ## Build and deploy to development environment in one command.
-	@echo "🎉 Development build and deploy completed!"
-
-.PHONY: build-and-deploy-prod
-build-and-deploy-prod: docker-buildx deploy-prod ## Build and deploy to production environment in one command.
-	@echo "🎉 Production build and deploy completed!"
-
-.PHONY: deploy-all
-deploy-all: deploy-rbac deploy ## Deploy RBAC and application resources.
-
-.PHONY: deploy-all-dev
-deploy-all-dev: deploy-rbac deploy-dev ## Deploy RBAC and application resources to development environment.
-
-.PHONY: deploy-all-prod
-deploy-all-prod: deploy-rbac deploy-prod ## Deploy RBAC and application resources to production environment.
 
 .PHONY: undeploy
 undeploy: kustomize ## Remove resources from the K8s cluster specified in ~/.kube/config.
@@ -242,33 +208,6 @@ undeploy-rbac: kustomize ## Remove RBAC resources from the K8s cluster.
 	@echo "Removing RBAC resources..."
 	$(KUSTOMIZE) build config/rbac | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 
-.PHONY: undeploy-all
-undeploy-all: undeploy undeploy-rbac ## Remove all resources from the K8s cluster.
-
-.PHONY: undeploy-all-dev
-undeploy-all-dev: undeploy-dev undeploy-rbac ## Remove all resources from development environment.
-
-.PHONY: undeploy-all-prod
-undeploy-all-prod: undeploy-prod undeploy-rbac ## Remove all resources from production environment.
-
-.PHONY: redeploy
-redeploy: undeploy deploy ## Redeploy to the K8s cluster (undeploy then deploy).
-
-.PHONY: redeploy-all
-redeploy-all: undeploy-all deploy-all ## Redeploy all resources to the K8s cluster.
-
-.PHONY: redeploy-dev
-redeploy-dev: undeploy-dev deploy-dev ## Redeploy to development environment.
-
-.PHONY: redeploy-prod
-redeploy-prod: undeploy-prod deploy-prod ## Redeploy to production environment.
-
-.PHONY: redeploy-all-dev
-redeploy-all-dev: undeploy-all-dev deploy-all-dev ## Redeploy all resources to development environment.
-
-.PHONY: redeploy-all-prod
-redeploy-all-prod: undeploy-all-prod deploy-all-prod ## Redeploy all resources to production environment.
-
 ##@ K3D Development
 
 .PHONY: k3d-build-push
@@ -279,22 +218,6 @@ k3d-build-push: docker-build ## Build and push image to k3d registry for develop
 
 .PHONY: k3d-deploy
 k3d-deploy: k3d-build-push deploy-all-dev ## Build, push to k3d registry and deploy to development.
-
-##@ Legacy Support
-
-.PHONY: rbac
-rbac: deploy-rbac ## Alias for deploy-rbac (backward compatibility).
-
-.PHONY: uninstall-local
-uninstall-local: kustomize  ## Uninstall resources from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	@if [ -z "$(USE_DEV_NS)" ]; then \
-		$(KUSTOMIZE) build config/rbac | kubectl delete --ignore-not-found=$(ignore-not-found) -f - && \
-		$(KUSTOMIZE) build config/overlays/$(OVERLAY) | kubectl delete --ignore-not-found=$(ignore-not-found) -f - ; \
-	else \
-		echo "Uninstalling resources from local tmp" && \
-		$(KUSTOMIZE) build tmp/rbac | kubectl delete --ignore-not-found=$(ignore-not-found) -f - && \
-		$(KUSTOMIZE) build tmp/config/overlays/$(OVERLAY) | kubectl delete --ignore-not-found=$(ignore-not-found) -f - ; \
-	fi
 
 ##@ Tools
 
@@ -360,4 +283,4 @@ $(PROTOC_GEN_GO): $(LOCALBIN)
 .PHONY: protoc-gen-go-grpc
 protoc-gen-go-grpc: $(PROTOC_GEN_GO_GRPC) ## Download protoc-gen-go-grpc locally if necessary.
 $(PROTOC_GEN_GO_GRPC): $(LOCALBIN)
-	test -s $(LOCALBIN)/protoc-gen-go-grpc || GOBIN=$(LOCALBIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)t 
+	test -s $(LOCALBIN)/protoc-gen-go-grpc || GOBIN=$(LOCALBIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
