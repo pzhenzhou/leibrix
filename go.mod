@@ -1,10 +1,12 @@
 module github.com/pzhenzhou/leibri.io
 
-go 1.24.8
+go 1.24
 
 require (
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/go-logr/logr v1.4.2
 	github.com/go-logr/zapr v1.3.0
+	github.com/puzpuzpuz/xsync/v4 v4.2.0
 	go.etcd.io/etcd/client/v3 v3.6.5
 	go.etcd.io/etcd/server/v3 v3.6.5
 	go.uber.org/zap v1.27.0

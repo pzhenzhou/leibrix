@@ -19,7 +19,7 @@ const (
 	electionKey       = "/leibri.io/cluster/leader-election"
 	membersKey        = "/leibri.io/cluster/members/"
 	sessionTTL        = 15
-	leaderChangeRetry = 3 * time.Second
+	leaderChangeRetry = 5 * time.Second
 )
 
 type MemberRole string
