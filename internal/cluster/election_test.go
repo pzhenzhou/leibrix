@@ -724,7 +724,7 @@ func TestThreeNodeLeaderElection(t *testing.T) {
 		} else {
 			t.Logf("  ✓ %s received %d leader event(s)", nodeNames[i], len(leaderEvents))
 			// Check the first event is LeaderElected
-			if leaderEvents[0].Type == LeaderElected {
+			if leaderEvents[0].Type == EvtLeaderElected {
 				t.Logf("    - First event: LeaderElected (%s)", leaderEvents[0].Member.Name)
 			}
 		}
