@@ -1,0 +1,58 @@
+# Leibrix Single Node Configuration
+# This configuration is suitable for development and testing on a single machine.
+
+node:
+  # Unique identifier for this node in the cluster
+  node_name: "leibrix-node1"
+  
+  # Hostname/IP where this node can be reached
+  host_name: "localhost"
+  
+  # Directory where etcd data will be stored
+  data_dir: "/tmp/leibrix/node1"
+  
+  # Port for Leibrix RPC services
+  rpc_port: 7003
+  
+  # Port for internal communication
+  listen_port: 2380
+  
+  # Port advertised to other nodes
+  advertise_addr: 2382
+
+cluster:
+  # Client URLs: Where applications connect to etcd
+  listen_client_urls:
+    - "http://localhost:2379"
+  
+  # Peer URLs: Where this node listens for peer-to-peer Raft communication
+  advertise_peer_urls:
+    - "http://localhost:2380"
+  
+  # Initial cluster topology (single node)
+  # Format: node_name=peer_url
+  initial_cluster: "leibrix-node1=http://localhost:2380"
+  
+  # Unique token to identify this cluster (prevents accidental cross-cluster joins)
+  initial_cluster_token: "leibrix-cluster-dev"
+  
+  # Performance tuning (optional)
+  # Number of committed transactions to trigger a snapshot
+  snapshot_count: 10000
+  
+  # Heartbeat interval in milliseconds (default: 100ms)
+  heartbeat_ms: 100
+  
+  # Election timeout in milliseconds (must be >= 10 * heartbeat_ms)
+  # Higher values increase latency but improve stability in high-latency networks
+  election_ms: 1000
+  
+  # Log level: debug, info, warn, error
+  log_level: "info"
+
+# Fencing token for disaster recovery (optional, leave at 0 for normal operations)
+# Only set this when:
+#   1. Recovering from backup (set higher than last known epoch)
+#   2. Migrating clusters (set higher than old cluster's epoch)
+# fencing_token: 0
+

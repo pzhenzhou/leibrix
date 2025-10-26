@@ -47,7 +47,7 @@ type sink struct {
 var logger = common.InitLogger()
 
 type LeibrixLeaderElection struct {
-	config    *conf.MasterConfig
+	config    *conf.LeibrixConfig
 	client    *clientv3.Client
 	session   *concurrencyv3.Session
 	election  *concurrencyv3.Election
@@ -67,25 +67,25 @@ type LeibrixLeaderElection struct {
 	//logger         *zap.Logger
 }
 
-func NewLeaderElection(config *conf.MasterConfig) (*LeibrixLeaderElection, error) {
+func NewLeaderElection(config *conf.LeibrixConfig) (*LeibrixLeaderElection, error) {
 
 	innerLogger, initLoggerErr := common.BuildZapLogger()
 	if initLoggerErr != nil {
 		panic(initLoggerErr)
 	}
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints: config.Endpoints,
+		Endpoints: config.ClusterConfig.ListenClientUrls,
 		Logger:    innerLogger,
 	})
 	if err != nil {
-		logger.Error(err, "Failed to create etcd client", "node", config.MasterNode.NodeName)
+		logger.Error(err, "Failed to create etcd client", "node", config.Node.NodeName)
 		panic(err)
 	}
 	node := &MemberNode{
-		Name:          config.MasterNode.NodeName,
+		Name:          config.Node.NodeName,
 		Role:          Candidate, // Start as a candidate
-		AdvertiseAddr: fmt.Sprintf("%s:%d", config.MasterNode.HostName, config.MasterNode.AdvertisePort),
-		ListenAddr:    fmt.Sprintf("%s:%d", config.MasterNode.HostName, config.MasterNode.ListenPort),
+		AdvertiseAddr: fmt.Sprintf("%s:%d", config.Node.HostName, config.Node.AdvertisePort),
+		ListenAddr:    fmt.Sprintf("%s:%d", config.Node.HostName, config.Node.ListenPort),
 	}
 
 	return &LeibrixLeaderElection{
@@ -163,7 +163,7 @@ func (l *LeibrixLeaderElection) registerMember(ctx context.Context) error {
 		return fmt.Errorf("failed to marshal member data: %w", err)
 	}
 
-	memberKey := membersKey + l.config.MasterNode.NodeName
+	memberKey := membersKey + l.config.Node.NodeName
 
 	// CRITICAL: Use session's lease for atomic lifecycle management.
 	// This ensures member registration and election share the same lease,
@@ -327,14 +327,14 @@ func (l *LeibrixLeaderElection) observeLeader(ctx context.Context) {
 				return
 			}
 			if len(resp.Kvs) > 0 {
-				l.lock.Lock()
-				leaderName := string(resp.Kvs[0].Value)
-				if leaderName == l.config.MasterNode.NodeName {
-					l.myNode.Role = Leader
-				} else {
-					l.myNode.Role = Follower
-				}
-				l.lock.Unlock()
+			l.lock.Lock()
+			leaderName := string(resp.Kvs[0].Value)
+			if leaderName == l.config.Node.NodeName {
+				l.myNode.Role = Leader
+			} else {
+				l.myNode.Role = Follower
+			}
+			l.lock.Unlock()
 
 				logger.Info("observed new leader", "leader", leaderName)
 
@@ -372,7 +372,7 @@ func (l *LeibrixLeaderElection) loseLeadership() {
 	ev := LeaderEvent{
 		Type: EvtLeaderResigned,
 		Member: &MemberNode{
-			Name: l.config.MasterNode.NodeName,
+			Name: l.config.Node.NodeName,
 		},
 	}
 	l.broadcastLeaderEvent(ev)

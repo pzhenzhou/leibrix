@@ -12,6 +12,7 @@ import (
 
 const (
 	ENVKeyLeibrixRuntime = "LEIBRIX_RUNTIME"
+	ENVConfigFilePath    = "LEIBRIX_CONFIG_PATH"
 )
 
 func IsProdRuntime() bool {

@@ -184,15 +184,17 @@ func startEmbeddedEtcd(t *testing.T) (*embed.Etcd, string, func()) {
 }
 
 // createTestConfig creates a test configuration
-func createTestConfig(nodeName, clientURL string) *conf.MasterConfig {
-	return &conf.MasterConfig{
-		MasterNode: conf.MasterNode{
+func createTestConfig(nodeName, clientURL string) *conf.LeibrixConfig {
+	return &conf.LeibrixConfig{
+		Node: conf.NodeConfig{
 			NodeName:      nodeName,
 			HostName:      "localhost",
 			ListenPort:    2380,
 			AdvertisePort: 2382,
 		},
-		Endpoints: []string{clientURL},
+		ClusterConfig: conf.ClusterConfig{
+			ListenClientUrls: []string{clientURL},
+		},
 	}
 }
 
@@ -336,7 +338,7 @@ func TestSingleLeaseForElectionAndMembership(t *testing.T) {
 
 	// Step 3: Verify member key exists and get its lease
 	t.Log("Step 3: Verifying member key in etcd...")
-	memberKey := membersKey + config.MasterNode.NodeName
+	memberKey := membersKey + config.Node.NodeName
 	resp, err := election.client.Get(ctx, memberKey)
 	if err != nil {
 		t.Fatalf("Failed to get member key from etcd: %v", err)
@@ -465,7 +467,7 @@ func TestSessionExpirationRemovesMember(t *testing.T) {
 		t.Fatalf("Failed to register member: %v", err)
 	}
 
-	memberKey := membersKey + config.MasterNode.NodeName
+	memberKey := membersKey + config.Node.NodeName
 	t.Logf("  Member registered: %s", memberKey)
 
 	// Step 2: Verify member key exists
@@ -519,7 +521,7 @@ func TestSessionExpirationRemovesMember(t *testing.T) {
 	// Count keys that belong to this specific node (if any)
 	nodeElectionKeys := 0
 	for _, kv := range electionResp.Kvs {
-		if string(kv.Value) == config.MasterNode.NodeName {
+		if string(kv.Value) == config.Node.NodeName {
 			nodeElectionKeys++
 		}
 	}

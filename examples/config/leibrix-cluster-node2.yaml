@@ -1,0 +1,49 @@
+# Leibrix Cluster Configuration - Node 2 of 3
+# This is a production-ready 3-node cluster configuration.
+# Replace IP addresses with your actual node IPs.
+
+node:
+  # Unique identifier for this node
+  node_name: "leibrix-node2"
+  
+  # This node's hostname/IP (replace with actual IP)
+  host_name: "10.0.1.102"
+  
+  # Directory where etcd data will be stored
+  data_dir: "/var/lib/leibrix/node2"
+  
+  # Port for Leibrix RPC services
+  rpc_port: 7003
+  
+  # Port for internal communication
+  listen_port: 2380
+  
+  # Port advertised to other nodes
+  advertise_addr: 2382
+
+cluster:
+  # Client URLs: Where applications connect to etcd on this node
+  listen_client_urls:
+    - "http://10.0.1.102:2379"
+  
+  # Peer URLs: Where this node listens for peer-to-peer Raft communication
+  advertise_peer_urls:
+    - "http://10.0.1.102:2380"
+  
+  # Initial cluster topology (all 3 nodes)
+  # IMPORTANT: Must be identical across all nodes
+  initial_cluster: "leibrix-node1=http://10.0.1.101:2380,leibrix-node2=http://10.0.1.102:2380,leibrix-node3=http://10.0.1.103:2380"
+  
+  # Unique token to identify this cluster
+  # IMPORTANT: Use the same token across all nodes in the cluster
+  initial_cluster_token: "leibrix-cluster-prod-001"
+  
+  # Performance tuning
+  snapshot_count: 10000
+  heartbeat_ms: 100
+  election_ms: 1000
+  log_level: "info"
+
+# Fencing token (optional, for disaster recovery only)
+# fencing_token: 0
+
