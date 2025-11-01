@@ -302,8 +302,8 @@ func TestStartAndClose(t *testing.T) {
 }
 
 // TestSingleLeaseForElectionAndMembership verifies that both election and member
-// registration share the same session lease, ensuring atomic lifecycle management.
-// This test validates the core refactoring that eliminates duplicate lease management.
+// registration share the same session lease, ensuring atomic lifecycle assignment.
+// This test validates the core refactoring that eliminates duplicate lease assignment.
 func TestSingleLeaseForElectionAndMembership(t *testing.T) {
 	_, clientURL, cleanup := startEmbeddedEtcd(t)
 	defer cleanup()

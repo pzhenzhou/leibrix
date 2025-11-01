@@ -56,7 +56,7 @@ type LeibrixLeaderElection struct {
 	myNode *MemberNode
 
 	// memberLease removed - using session.Lease() for both election and membership
-	// This ensures atomic lifecycle management and automatic cleanup
+	// This ensures atomic lifecycle assignment and automatic cleanup
 
 	// shutdown
 	cancel context.CancelFunc
@@ -165,7 +165,7 @@ func (l *LeibrixLeaderElection) registerMember(ctx context.Context) error {
 
 	memberKey := membersKey + l.config.Node.NodeName
 
-	// CRITICAL: Use session's lease for atomic lifecycle management.
+	// CRITICAL: Use session's lease for atomic lifecycle assignment.
 	// This ensures member registration and election share the same lease,
 	// guaranteeing consistent expiration and automatic cleanup.
 	// When the session expires or is closed:
@@ -327,14 +327,14 @@ func (l *LeibrixLeaderElection) observeLeader(ctx context.Context) {
 				return
 			}
 			if len(resp.Kvs) > 0 {
-			l.lock.Lock()
-			leaderName := string(resp.Kvs[0].Value)
-			if leaderName == l.config.Node.NodeName {
-				l.myNode.Role = Leader
-			} else {
-				l.myNode.Role = Follower
-			}
-			l.lock.Unlock()
+				l.lock.Lock()
+				leaderName := string(resp.Kvs[0].Value)
+				if leaderName == l.config.Node.NodeName {
+					l.myNode.Role = Leader
+				} else {
+					l.myNode.Role = Follower
+				}
+				l.lock.Unlock()
 
 				logger.Info("observed new leader", "leader", leaderName)
 

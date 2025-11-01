@@ -7,6 +7,8 @@ option go_package = "github.com/pzhenzhou/leibri.io/pkg/proto";
 service ManagementService {
   // AdmitDataset instructs the Master to load a specific dataset into the speed layer.
   rpc AdmitDataset(AdmitDatasetRequest) returns (AdmitDatasetResponse);
+  // UpsertTenantQuota creates or updates the quota settings for a tenant.
+  rpc UpsertTenantQuota(TenantQuota) returns (CommonResponse);
 }
 
 message AdmitDatasetRequest {
@@ -16,9 +18,60 @@ message AdmitDatasetRequest {
   // The core of the request, specifying which data to load using the unified
   // catalog-centric model.
   DataSource source = 3;
+
+  // OPTIONAL: Epoch grouping granularity
+  // Controls how many source partitions are grouped into one epoch.
+  // If not specified, defaults to matching source granularity (1:1 mapping).
+  // Examples (assuming source is daily partitioned):
+  // - {value: 1, unit: DAY}: 1 day partition = 1 epoch (default)
+  // - {value: 3, unit: DAY}: 3 day partitions = 1 epoch
+  // - {value: 1, unit: WEEK}: 7 day partitions = 1 epoch
+  optional EpochGranularity epoch_granularity = 4;
 }
 
 message AdmitDatasetResponse {
+  // Unique request ID for idempotency and tracking
+  string request_id = 1;
+
+  // All epochs created from this admission request
+  // One request can generate multiple epochs based on:
+  // - Time range span
+  // - Epoch granularity setting
+  // - Dimension partition combinations (if multi-dimensional)
+  // Note: Data is NOT loaded yet; this is just the admission response.
+  repeated EpochInfo epochs = 2;
+
+  enum Status {
+    UNKNOWN = 0;
+    ACCEPTED = 1;   // All epochs accepted and assignment initiated
+    REJECTED = 2;   // Request rejected (validation failure, quota exceeded, etc.)
+  }
+  Status status = 3;
+
+  string message = 4;
+}
+
+// Metadata about an epoch created by the admission request
+// This is synchronous - just the epoch metadata, not actual data stats
+message EpochInfo {
+  // Time-sortable epoch identifier
+  // Format: {start_timestamp_ms}_{hash_suffix}
+  // Example: "1730419200000_a7b3c2" for 2025-10-25
+  // This epoch_id will become the table name suffix in DuckDB:
+  // {dataset_id}_{epoch_id}
   string epoch_id = 1;
-  string message = 2;
+
+  // The time range this epoch covers
+  TimeRange time_range = 2;
+
+  // Additional partition dimensions (if any)
+  // e.g., {"country": "US", "region": "west"}
+  map<string, string> dimension_values = 3;
+}
+
+message TenantQuota {
+  string tenant_id = 1;
+  int32 max_datasets = 2;
+  int32 max_epochs = 3;
+  int64 max_storage_mb = 4;
 }

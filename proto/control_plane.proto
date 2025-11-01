@@ -74,6 +74,34 @@ message HeartbeatAckEvent {
 message LoadPlan {
   string plan_id = 1;
   DataSource source = 2;
+
+  // The table name in DuckDB following the pattern: {dataset_id}__{epoch_id}
+  // Example: "sales_data__1730419200000_a7b3c2"
+  // This establishes the 1:1 relationship: one epoch_id = one DuckDB table
   string destination_table_name = 3;
+
   bytes arrow_schema = 4;
+
+  // REQUIRED: Resolved partition information for this specific epoch
+  // This tells the Worker exactly what time range and partition values
+  // this epoch represents, enabling it to generate the optimized table macro
+  ResolvedPartition resolved_partition = 5;
+}
+
+// The concrete partition values for a single epoch
+// This is what the Worker needs to generate the table macro constants
+message ResolvedPartition {
+  // The time range this epoch represents (REQUIRED)
+  // Used in macro: WHERE (DATE 'start' >= start_dt AND DATE 'start' < end_excl)
+  TimeRange time_range = 1;
+  // The name of the time partition column in the loaded data
+  // Used in macro: AND dt = DATE '2025-10-25'
+  string time_column_name = 2;
+  // The specific time partition value(s) this epoch contains
+  // For single partition: "2025-10-25"
+  // For coalesced epochs: start date of the range
+  string time_partition_value = 3;
+
+  // Additional dimension partition values (if multi-dimensional)
+  map<string, string> dimension_values = 4;
 }

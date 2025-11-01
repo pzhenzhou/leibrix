@@ -68,14 +68,20 @@ all: build
 
 .PHONY: fmt
 fmt:
-	gofmt -l -w -d  ./pkg ./cmd
+	gofmt -l -w -d  ./pkg ./cmd ./internal
 
 .PHONY: vet
 vet: ## Run go vet against code.
 	go vet ./...
 
+
+proto-tools:
+	test -s $(LOCALBIN)/protoc-gen-go || GOBIN=$(LOCALBIN) go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.8
+	test -s $(LOCALBIN)/protoc-gen-go-grpc || GOBIN=$(LOCALBIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+
+
 .PHONY: proto-generate
-proto-generate: protoc protoc-gen-go protoc-gen-go-grpc
+proto-generate: proto-tools
 	PATH="$(LOCALBIN):$$PATH" $(PROTOC) \
 	--go_out=$(PROTO_OUT) \
 	--go-grpc_out=$(PROTO_OUT) \
