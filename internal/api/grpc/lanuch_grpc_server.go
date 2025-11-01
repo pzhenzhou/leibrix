@@ -46,33 +46,24 @@ type LeibrixGRPCServer struct {
 
 // NewGRPCServer creates a new gRPC server instance
 func NewGRPCServer(config *conf.LeibrixConfig) (*LeibrixGRPCServer, error) {
-	// Configure gRPC server options
-
-	// Create gRPC server
 	grpcServer := grpc.NewServer(grpcOpts...)
-
 	// Initialize ManagementService
 	managementSvc, err := NewManagementService(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ManagementService: %w", err)
 	}
-
 	// Register services
 	myproto.RegisterManagementServiceServer(grpcServer, managementSvc)
 	logger.Info("ManagementService registered successfully")
-
 	// Register health check service
 	healthServer := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
 	healthServer.SetServingStatus("leibrix.ManagementService", grpc_health_v1.HealthCheckResponse_SERVING)
 	logger.Info("Health check service registered")
-
 	// Register reflection service for debugging
 	reflection.Register(grpcServer)
 	logger.Info("Reflection service registered")
-
 	listenAddr := fmt.Sprintf("%s:%d", config.Node.HostName, config.Node.RPCPort)
-
 	return &LeibrixGRPCServer{
 		config:        config,
 		grpcServer:    grpcServer,
@@ -87,15 +78,11 @@ func (s *LeibrixGRPCServer) Start(ctx context.Context) error {
 	logger.Info("Starting Leibrix Master gRPC server",
 		"address", s.listenAddr,
 		"node", s.config.Node.NodeName)
-
-	// Create TCP listener
 	lis, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
 		logger.Error(err, "Failed to listen", "address", s.listenAddr)
 		return fmt.Errorf("failed to listen on %s: %w", s.listenAddr, err)
 	}
-
-	// Start server in a goroutine
 	serverErrCh := make(chan error, 1)
 	go func() {
 		logger.Info("gRPC server listening", "address", s.listenAddr)
@@ -104,12 +91,9 @@ func (s *LeibrixGRPCServer) Start(ctx context.Context) error {
 			serverErrCh <- err
 		}
 	}()
-
-	// Wait for context cancellation or server error
 	select {
 	case <-ctx.Done():
 		logger.Info("gRPC server context cancelled, initiating shutdown")
-		// Note: shutdown() is called, but Start() returns immediately
 		// The actual shutdown completion is handled by Shutdown() method
 		s.initiateShutdown()
 		return ctx.Err()
@@ -121,25 +105,20 @@ func (s *LeibrixGRPCServer) Start(ctx context.Context) error {
 // Shutdown gracefully shuts down the gRPC server with a timeout
 func (s *LeibrixGRPCServer) Shutdown(ctx context.Context) error {
 	logger.Info("Shutting down gRPC server...")
-
 	// Mark service as not serving
 	s.healthServer.SetServingStatus("leibrix.ManagementService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
-
 	// Close the management service (closes etcd client)
 	if closer, ok := s.managementSvc.(interface{ Close() error }); ok {
 		if err := closer.Close(); err != nil {
 			logger.Error(err, "Error closing ManagementService")
 		}
 	}
-
 	// Graceful stop with context timeout
 	stopped := make(chan struct{})
 	go func() {
 		s.grpcServer.GracefulStop()
 		close(stopped)
 	}()
-
-	// Wait for graceful stop or context timeout
 	select {
 	case <-stopped:
 		logger.Info("gRPC server stopped gracefully")
@@ -163,8 +142,6 @@ func (s *LeibrixGRPCServer) Stop() {
 }
 
 // LeibrixMasterGRPCServer launches the gRPC server for the Leibrix Master node.
-// This is a convenience function that creates and starts the server with signal handling.
-// For better integration with existing shutdown logic, use NewGRPCServer and Start directly.
 func LeibrixMasterGRPCServer(config *conf.LeibrixConfig) error {
 	server, err := NewGRPCServer(config)
 	if err != nil {
