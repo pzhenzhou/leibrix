@@ -89,10 +89,6 @@ func (m *ManagementRPCService) AdmitDataset(ctx context.Context, request *myprot
 		return nil, saveEpochErr
 	}
 	// TODO: Step Trigger worker assignment for data loading (etcd watch)
-	logger.Info("Dataset admission accepted",
-		"tenant_id", tenantId,
-		"dataset_id", request.DatasetId,
-		"epochs", len(epochs))
 	return &myproto.AdmitDatasetResponse{
 		Status: myproto.AdmitDatasetResponse_ACCEPTED,
 		Epochs: &myproto.EpochInfoList{
@@ -125,8 +121,6 @@ func (m *ManagementRPCService) saveEpochs(ctx context.Context, request *myproto.
 		return nil
 	}
 
-	// Find epochs that exist in existEpochList but not in new epochs
-	// and append them to preserve existing data
 	epochList := &myproto.EpochInfoList{
 		Epochs: epochs,
 	}
