@@ -8,7 +8,6 @@ import (
 	"github.com/pzhenzhou/leibri.io/internal/conf"
 	"github.com/pzhenzhou/leibri.io/pkg/common"
 	myproto "github.com/pzhenzhou/leibri.io/pkg/proto"
-	"github.com/samber/lo"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/protobuf/proto"
 )
@@ -119,29 +118,40 @@ func (m *ManagementRPCService) saveEpochs(ctx context.Context, request *myproto.
 		}
 		return fmt.Errorf("failed to get existing epoch list: %w", err)
 	}
-	left, right := lo.Difference(existEpochList.Epochs, epochs)
-	if len(left) == 0 && len(right) == 0 {
+
+	// Compare existing epochs with new epochs using protobuf's Equal method
+	if areEpochSlicesEqual(existEpochList.Epochs, epochs) {
 		logger.Info("No new epochs to save", "tenant_id", request.TenantId, "dataset_id", request.DatasetId)
 		return nil
 	}
+
+	// Find epochs that exist in existEpochList but not in new epochs
+	// and append them to preserve existing data
 	epochList := &myproto.EpochInfoList{
 		Epochs: epochs,
 	}
-	if len(left) > 0 {
-		epochList.Epochs = append(epochList.Epochs, left...)
+	for _, existEpoch := range existEpochList.Epochs {
+		if !containsEpoch(epochs, existEpoch) {
+			epochList.Epochs = append(epochList.Epochs, existEpoch)
+		}
 	}
 	epochListBytes, _ := proto.Marshal(epochList)
 	txn := m.etcdClient.Txn(context.Background())
 	commit, commitErr := txn.If(clientv3.Compare(clientv3.ModRevision(epochListKey), "=", getRsp.Kvs[0].ModRevision)).
 		Then(clientv3.OpPut(epochListKey, string(epochListBytes))).Else(clientv3.OpGet(epochListKey)).Commit()
 	if commitErr != nil {
+		logger.Error(commitErr, "Failed to commit epoch list transaction to etcd",
+			"tenant_id", request.TenantId, "dataset_id", request.DatasetId)
 		return commitErr
 	}
 	if !commit.Succeeded {
-		logger.Error(fmt.Errorf("concurrent modification detected"), "Failed to save Epochs to etcd due to concurrent modification", "tenant_id", request.TenantId, "dataset_id", request.DatasetId)
+		logger.Error(fmt.Errorf("concurrent modification detected"),
+			"Failed to save Epochs to etcd due to concurrent modification",
+			"tenant_id", request.TenantId, "dataset_id", request.DatasetId)
 		return fmt.Errorf("failed to save epoch list due to concurrent modification")
 	}
-	logger.Info("Successfully saved epochs to etcd", "tenant_id", request.TenantId, "dataset_id", request.DatasetId, "epoch_count", len(epochs))
+	logger.Info("Successfully saved epochs to etcd", "tenant_id", request.TenantId, "dataset_id",
+		request.DatasetId, "epoch_count", len(epochs))
 	return nil
 }
 
@@ -194,4 +204,41 @@ func (m *ManagementRPCService) Close() error {
 		return m.etcdClient.Close()
 	}
 	return nil
+}
+
+// areEpochSlicesEqual compares two slices of EpochInfo using protobuf's Equal method
+func areEpochSlicesEqual(a, b []*myproto.EpochInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	// Create a map to track matched indices in slice b
+	matched := make([]bool, len(b))
+
+	// For each epoch in a, find a matching epoch in b
+	for _, epochA := range a {
+		found := false
+		for j, epochB := range b {
+			if !matched[j] && proto.Equal(epochA, epochB) {
+				matched[j] = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+
+	return true
+}
+
+// containsEpoch checks if a slice contains a specific epoch using protobuf's Equal method
+func containsEpoch(epochs []*myproto.EpochInfo, target *myproto.EpochInfo) bool {
+	for _, epoch := range epochs {
+		if proto.Equal(epoch, target) {
+			return true
+		}
+	}
+	return false
 }
