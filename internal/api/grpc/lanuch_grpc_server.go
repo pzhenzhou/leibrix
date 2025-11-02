@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/pzhenzhou/leibri.io/internal/conf"
@@ -13,6 +14,8 @@ import (
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -149,4 +152,42 @@ func LeibrixMasterGRPCServer(config *conf.LeibrixConfig) error {
 	}
 	// Run with background context (will handle its own signals)
 	return server.Start(context.Background())
+}
+
+func getClientIp(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if ok {
+		// Check for "x-forwarded-for"
+		// The first IP is generally the original client.
+		if xff := md.Get("x-forwarded-for"); len(xff) > 0 {
+			ips := strings.Split(xff[0], ",")
+			if len(ips) > 0 {
+				clientIP := strings.TrimSpace(ips[0])
+				if ip := net.ParseIP(clientIP); ip != nil {
+					return clientIP
+				}
+			}
+		}
+		// Check for "x-real-ip"
+		if xri := md.Get("x-real-ip"); len(xri) > 0 {
+			clientIP := strings.TrimSpace(xri[0])
+			if ip := net.ParseIP(clientIP); ip != nil {
+				return clientIP
+			}
+		}
+	}
+	// 2. Fall back to direct peer address
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return "unknown"
+	}
+	// p.Addr is of type net.Addr
+	if tcpAddr, ok := p.Addr.(*net.TCPAddr); ok {
+		return tcpAddr.IP.String()
+	}
+	addr := p.Addr.String()
+	if ip, _, err := net.SplitHostPort(addr); err == nil {
+		return ip
+	}
+	return addr
 }

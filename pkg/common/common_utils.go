@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 )
 
@@ -42,4 +44,28 @@ func BuildZapLogger() (*zap.Logger, error) {
 		logConfig.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
 	}
 	return logConfig.Build()
+}
+
+func EtcdTenantQuotaKey(tenantId string) string {
+	return fmt.Sprintf("/leibrix/tenants/%s/quota", tenantId)
+}
+
+func EtcdTenantDatasetEpochKey(tenantId, dataSetId string) string {
+	return fmt.Sprintf("/leibrix/tenants/%s/datasets/%s", tenantId, dataSetId)
+}
+
+func DefaultEtcdClientConfig(endpoint []string) clientv3.Config {
+	return clientv3.Config{
+		Endpoints:            endpoint,
+		DialTimeout:          5 * time.Second,
+		DialKeepAliveTime:    2 * time.Second,
+		DialKeepAliveTimeout: 2 * time.Second,
+		AutoSyncInterval:     30 * time.Second,
+		MaxCallSendMsgSize:   16 * 1024 * 1024,
+		MaxCallRecvMsgSize:   16 * 1024 * 1024,
+	}
+}
+
+func NewEtcdClient(endpoint []string) (*clientv3.Client, error) {
+	return clientv3.New(DefaultEtcdClientConfig(endpoint))
 }

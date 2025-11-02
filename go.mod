@@ -8,6 +8,7 @@ require (
 	github.com/go-logr/zapr v1.3.0
 	github.com/goccy/go-yaml v1.18.0
 	github.com/puzpuzpuz/xsync/v4 v4.2.0
+	github.com/samber/lo v1.52.0
 	go.etcd.io/etcd/client/v3 v3.6.5
 	go.etcd.io/etcd/server/v3 v3.6.5
 	go.uber.org/zap v1.27.0
