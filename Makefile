@@ -81,7 +81,7 @@ proto-tools:
 
 
 .PHONY: proto-generate
-proto-generate: proto-tools
+proto-generate: proto-tools protoc
 	PATH="$(LOCALBIN):$$PATH" $(PROTOC) \
 	--go_out=$(PROTO_OUT) \
 	--go-grpc_out=$(PROTO_OUT) \
