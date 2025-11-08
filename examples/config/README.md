@@ -70,7 +70,7 @@ In normal operations, leave this at 0 (or omit it).
 ### Development (Single Node)
 ```bash
 # Copy the example configuration
-cp examples/config/leibrix-single-node.yaml config.yaml
+events examples/config/leibrix-single-node.yaml config.yaml
 
 # Edit for your environment (optional for development)
 vim config.yaml
@@ -92,17 +92,17 @@ LEIBRIX_CONFIG_PATH=examples/config/leibrix-single-node.yaml ./leibrix-srv
 ```bash
 # On node 1 (10.0.1.101)
 # Copy and customize the configuration
-cp examples/config/leibrix-cluster-node1.yaml config.yaml
+events examples/config/leibrix-cluster-node1.yaml config.yaml
 vim config.yaml  # Update IPs, paths, etc.
 ./leibrix-srv
 
 # On node 2 (10.0.1.102)
-cp examples/config/leibrix-cluster-node2.yaml config.yaml
+events examples/config/leibrix-cluster-node2.yaml config.yaml
 vim config.yaml
 ./leibrix-srv
 
 # On node 3 (10.0.1.103)
-cp examples/config/leibrix-cluster-node3.yaml config.yaml
+events examples/config/leibrix-cluster-node3.yaml config.yaml
 vim config.yaml
 ./leibrix-srv
 ```

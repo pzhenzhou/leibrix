@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pzhenzhou/leibri.io/internal/api/grpc/events"
 	"github.com/pzhenzhou/leibri.io/internal/conf"
 	"github.com/pzhenzhou/leibri.io/pkg/common"
 	myproto "github.com/pzhenzhou/leibri.io/pkg/proto"
@@ -40,39 +41,54 @@ var (
 
 // LeibrixGRPCServer wraps the gRPC server and provides lifecycle management
 type LeibrixGRPCServer struct {
-	config        *conf.LeibrixConfig
-	grpcServer    *grpc.Server
-	healthServer  *health.Server
-	managementSvc myproto.ManagementServiceServer
-	listenAddr    string
+	config          *conf.LeibrixConfig
+	grpcServer      *grpc.Server
+	healthServer    *health.Server
+	managementSvc   myproto.ManagementServiceServer
+	controlPlaneSvc myproto.ControlPlaneServiceServer
+	sessionManager  *events.SessionManager
+	listenAddr      string
 }
 
 // NewGRPCServer creates a new gRPC server instance
 func NewGRPCServer(config *conf.LeibrixConfig) (*LeibrixGRPCServer, error) {
 	grpcServer := grpc.NewServer(grpcOpts...)
+
 	// Initialize ManagementService
 	managementSvc, err := NewManagementService(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ManagementService: %w", err)
 	}
-	// Register services
 	myproto.RegisterManagementServiceServer(grpcServer, managementSvc)
 	logger.Info("ManagementService registered successfully")
+
+	// Initialize ControlPlaneService
+	sessionManager := events.NewSessionManager()
+	dispatcher := events.NewEventDispatcher()
+	controlPlaneSvc := NewControlPlaneService(config, dispatcher, sessionManager)
+	myproto.RegisterControlPlaneServiceServer(grpcServer, controlPlaneSvc)
+	logger.Info("ControlPlaneService registered successfully")
+
 	// Register health check service
 	healthServer := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
 	healthServer.SetServingStatus("leibrix.ManagementService", grpc_health_v1.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("leibrix.ControlPlaneService", grpc_health_v1.HealthCheckResponse_SERVING)
 	logger.Info("Health check service registered")
+
 	// Register reflection service for debugging
 	reflection.Register(grpcServer)
 	logger.Info("Reflection service registered")
+
 	listenAddr := fmt.Sprintf("%s:%d", config.Node.HostName, config.Node.RPCPort)
 	return &LeibrixGRPCServer{
-		config:        config,
-		grpcServer:    grpcServer,
-		healthServer:  healthServer,
-		managementSvc: managementSvc,
-		listenAddr:    listenAddr,
+		config:          config,
+		grpcServer:      grpcServer,
+		healthServer:    healthServer,
+		managementSvc:   managementSvc,
+		controlPlaneSvc: controlPlaneSvc,
+		sessionManager:  sessionManager,
+		listenAddr:      listenAddr,
 	}, nil
 }
 
@@ -108,14 +124,23 @@ func (s *LeibrixGRPCServer) Start(ctx context.Context) error {
 // Shutdown gracefully shuts down the gRPC server with a timeout
 func (s *LeibrixGRPCServer) Shutdown(ctx context.Context) error {
 	logger.Info("Shutting down gRPC server...")
-	// Mark service as not serving
+
 	s.healthServer.SetServingStatus("leibrix.ManagementService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	s.healthServer.SetServingStatus("leibrix.ControlPlaneService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+
+	// Close all active sessions
+	if s.sessionManager != nil {
+		s.sessionManager.Close()
+		logger.Info("SessionManager closed, all sessions terminated")
+	}
+
 	// Close the management service (closes etcd client)
 	if closer, ok := s.managementSvc.(interface{ Close() error }); ok {
 		if err := closer.Close(); err != nil {
 			logger.Error(err, "Error closing ManagementService")
 		}
 	}
+
 	// Graceful stop with context timeout
 	stopped := make(chan struct{})
 	go func() {
@@ -137,6 +162,7 @@ func (s *LeibrixGRPCServer) Shutdown(ctx context.Context) error {
 // This is a non-blocking operation that prepares for shutdown
 func (s *LeibrixGRPCServer) initiateShutdown() {
 	s.healthServer.SetServingStatus("leibrix.ManagementService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	s.healthServer.SetServingStatus("leibrix.ControlPlaneService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
 }
 
 // Stop immediately stops the gRPC server
