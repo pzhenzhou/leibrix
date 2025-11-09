@@ -21,14 +21,14 @@ type Session struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	ServerId   string
-	outbox     chan *myproto.EventResponse
-	stream     grpc.BidiStreamingServer[myproto.EventStreamMessage, myproto.EventResponse]
+	outbox     chan *myproto.EventStreamMessage
+	stream     grpc.BidiStreamingServer[myproto.EventStreamMessage, myproto.EventStreamMessage]
 	writerDone chan struct{}
 	closed     int32
 }
 
 func NewSession(ctx context.Context, sererId string,
-	stream grpc.BidiStreamingServer[myproto.EventStreamMessage, myproto.EventResponse]) *Session {
+	stream grpc.BidiStreamingServer[myproto.EventStreamMessage, myproto.EventStreamMessage]) *Session {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	return &Session{
 		ctx:        sessionCtx,
@@ -36,7 +36,7 @@ func NewSession(ctx context.Context, sererId string,
 		ServerId:   sererId,
 		stream:     stream,
 		writerDone: make(chan struct{}),
-		outbox:     make(chan *myproto.EventResponse, DefaultSessionOutboxSize),
+		outbox:     make(chan *myproto.EventStreamMessage, DefaultSessionOutboxSize),
 		closed:     SessionOpen,
 	}
 }
@@ -58,10 +58,10 @@ func (s *Session) drainOutbox() {
 	}
 }
 
-// Send enqueues a response to be sent to the client
-func (s *Session) Send(resp *myproto.EventResponse) error {
+// Send enqueues an event message to be sent to the client
+func (s *Session) Send(msg *myproto.EventStreamMessage) error {
 	select {
-	case s.outbox <- resp:
+	case s.outbox <- msg:
 		return nil
 	case <-s.ctx.Done():
 		return fmt.Errorf("session closed: %w", s.ctx.Err())

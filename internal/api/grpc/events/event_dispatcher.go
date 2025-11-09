@@ -22,10 +22,11 @@ const (
 	EventTypeRegister      EventType = "REGISTER"
 	EventTypeDataPullState EventType = "DATA_PULL_STATE"
 	EventTypeDataAssigment EventType = "DATA_ASSIGNMENT"
+	EventTypeCommonAck     EventType = "COMMON_ACK"
 )
 
 type EventHandler interface {
-	OnEvent(context.Context, proto.Message) (*myproto.EventResponse, error)
+	OnEvent(context.Context, proto.Message) (*myproto.EventStreamMessage, error)
 }
 
 type EventDispatcher struct {
@@ -42,7 +43,7 @@ func (d *EventDispatcher) Register(eventType EventType, handler EventHandler) {
 	d.handlers.LoadOrStore(eventType, handler)
 }
 
-func (d *EventDispatcher) Dispatch(ctx context.Context, eventType EventType, event proto.Message) (*myproto.EventResponse, error) {
+func (d *EventDispatcher) Dispatch(ctx context.Context, eventType EventType, event proto.Message) (*myproto.EventStreamMessage, error) {
 	handler, ok := d.handlers.Load(eventType)
 	if !ok {
 		return nil, fmt.Errorf("no handler for event type: %s", eventType)
@@ -51,6 +52,11 @@ func (d *EventDispatcher) Dispatch(ctx context.Context, eventType EventType, eve
 }
 
 func RegisterAllEventHandlers(dispatcher *EventDispatcher, config *conf.LeibrixConfig) {
-	// This function can be used to register all event handlers at once.
-	panic("not implemented")
+	// Register heartbeat handler
+	dispatcher.Register(EventTypeHeartbeat, NewHeartbeatHandler(config.Node.NodeName))
+
+	// TODO: Register other handlers as they are implemented
+	// dispatcher.Register(EventTypeRegister, NewRegisterHandler(config))
+	// dispatcher.Register(EventTypeDataPullState, NewDataPullStateHandler(config))
+	// dispatcher.Register(EventTypeDataAssigment, NewDataAssignmentHandler(config))
 }

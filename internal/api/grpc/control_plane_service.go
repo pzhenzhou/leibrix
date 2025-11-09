@@ -29,7 +29,7 @@ func NewControlPlaneService(config *conf.LeibrixConfig, dispatcher *events.Event
 	}
 	return c
 }
-func (c *ControlPlaneService) CoordinateWorker(stream grpc.BidiStreamingServer[myproto.EventStreamMessage, myproto.EventResponse]) error {
+func (c *ControlPlaneService) CoordinateWorker(stream grpc.BidiStreamingServer[myproto.EventStreamMessage, myproto.EventStreamMessage]) error {
 	clientIp := getClientIp(stream.Context())
 	logger.Info("ControlPlaneService CoordinateWorker called", "clientIp", clientIp)
 
@@ -83,20 +83,30 @@ func (c *ControlPlaneService) handleEventAsync(
 	msg *myproto.EventStreamMessage,
 ) {
 	// Dispatch to appropriate handler based on oneof payload
-	resp, err := c.handleEvent(ctx, msg)
+	ackMsg, err := c.handleEvent(ctx, msg)
 	if err != nil {
-		resp = &myproto.EventResponse{
-			ServerId: session.ServerId,
-			Status:   myproto.ResponseStatus_ERROR,
-			Payload:  nil,
-		}
+		logger.Error(err, "Error handling event",
+			"event_id", msg.EventId,
+			"worker_id", msg.WorkerId)
+		// Send error ack
+		ackMsg = events.CreateCommonAckEvent(
+			session.ServerId,
+			"error_ack",
+			map[string]interface{}{
+				"error":             err.Error(),
+				"original_event_id": msg.EventId,
+			},
+		)
 	}
-	if sendErr := session.Send(resp); err != nil {
-		logger.Error(sendErr, "Error sending response to session", "serverId", session.ServerId)
+
+	if sendErr := session.Send(ackMsg); sendErr != nil {
+		logger.Error(sendErr, "Error sending ack to session",
+			"serverId", session.ServerId,
+			"event_id", msg.EventId)
 	}
 }
 
-func (c *ControlPlaneService) handleEvent(ctx context.Context, reqMsg *myproto.EventStreamMessage) (*myproto.EventResponse, error) {
+func (c *ControlPlaneService) handleEvent(ctx context.Context, reqMsg *myproto.EventStreamMessage) (*myproto.EventStreamMessage, error) {
 	switch payload := reqMsg.Payload.(type) {
 	case *myproto.EventStreamMessage_RegisterEvent:
 		return c.dispatcher.Dispatch(ctx, events.EventTypeRegister, payload.RegisterEvent)
@@ -109,6 +119,18 @@ func (c *ControlPlaneService) handleEvent(ctx context.Context, reqMsg *myproto.E
 
 	case *myproto.EventStreamMessage_DataAssignment:
 		return c.dispatcher.Dispatch(ctx, events.EventTypeDataAssigment, payload.DataAssignment)
+
+	case *myproto.EventStreamMessage_CommonAck:
+		// TODO : Process common ack
+		logger.Info("Received CommonAck from worker",
+			"event_id", reqMsg.EventId,
+			"worker_id", reqMsg.WorkerId)
+		// Return success ack
+		return events.CreateCommonAckEvent(
+			c.config.Node.NodeName,
+			"ack_received",
+			map[string]interface{}{"status": "ok"},
+		), nil
 
 	default:
 		return nil, fmt.Errorf("unknown event type in message %s", reqMsg.EventId)

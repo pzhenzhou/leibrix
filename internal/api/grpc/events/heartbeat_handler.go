@@ -6,7 +6,6 @@ import (
 
 	myproto "github.com/pzhenzhou/leibri.io/pkg/proto"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/structpb"
 )
 
 var _ EventHandler = (*HeartbeatHandler)(nil)
@@ -21,13 +20,14 @@ func NewHeartbeatHandler(serverId string) EventHandler {
 	}
 }
 
-func (h *HeartbeatHandler) OnEvent(_ context.Context, _ proto.Message) (*myproto.EventResponse, error) {
-	s, _ := structpb.NewStruct(map[string]interface{}{
+func (h *HeartbeatHandler) OnEvent(_ context.Context, _ proto.Message) (*myproto.EventStreamMessage, error) {
+	// Create acknowledgment with heartbeat response
+	payload := map[string]interface{}{
 		"ack_timestamp": time.Now().UnixNano(),
 		"server_id":     h.serverId,
-	})
-	return &myproto.EventResponse{
-		ServerId: h.serverId,
-		Payload:  s,
-	}, nil
+		"status":        "healthy",
+	}
+
+	// Return CommonAckEvent wrapped in EventStreamMessage
+	return CreateCommonAckEvent(h.serverId, "heartbeat_ack", payload), nil
 }

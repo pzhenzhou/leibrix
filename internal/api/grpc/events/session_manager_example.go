@@ -4,25 +4,20 @@ import (
 	"context"
 
 	myproto "github.com/pzhenzhou/leibri.io/pkg/proto"
-	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // Example: Broadcasting a message to all connected workers
 func ExampleBroadcastToAllWorkers(sessionManager *SessionManager) {
-	// Create a response to broadcast
-	resp := &myproto.EventResponse{
-		ServerId: "master-node-1",
-		Status:   myproto.ResponseStatus_SUCCESS,
-		Payload: &structpb.Struct{
-			Fields: map[string]*structpb.Value{
-				"message": structpb.NewStringValue("System maintenance in 5 minutes"),
-				"type":    structpb.NewStringValue("announcement"),
-			},
-		},
+	// Create a CommonAck event to broadcast (e.g., system announcement)
+	payload := map[string]interface{}{
+		"message": "System maintenance in 5 minutes",
+		"type":    "announcement",
 	}
 
+	msg := CreateCommonAckEvent("master-node-1", "system_announcement", payload)
+
 	// Broadcast to all connected workers
-	sessionManager.Broadcast(resp)
+	sessionManager.Broadcast(msg)
 	logger.Info("Broadcast sent to all workers",
 		"active_workers", sessionManager.ActiveWorkerCount())
 }
@@ -34,20 +29,8 @@ func ExampleSendDataAssignmentToWorker(
 	workerID string,
 	assignment *myproto.DataAssignmentEvent,
 ) error {
-	// Create the response with DataAssignment payload
-	resp := &myproto.EventResponse{
-		ServerId: "master-node-1",
-		Status:   myproto.ResponseStatus_SUCCESS,
-		Payload: &structpb.Struct{
-			Fields: map[string]*structpb.Value{
-				"dataset_id": structpb.NewStringValue(assignment.DatasetId),
-				"epoch_id":   structpb.NewStringValue(assignment.EpochId),
-			},
-		},
-	}
-
-	// Send to specific worker
-	if err := sessionManager.ToWorker(workerID, resp); err != nil {
+	// Use the helper method to send data assignment
+	if err := sessionManager.SendDataAssignment(workerID, "master-node-1", assignment); err != nil {
 		logger.Error(err, "Failed to send assignment to worker",
 			"worker_id", workerID,
 			"dataset_id", assignment.DatasetId)

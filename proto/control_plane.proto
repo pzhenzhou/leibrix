@@ -7,7 +7,7 @@ import "google/protobuf/struct.proto";
 option go_package = "github.com/pzhenzhou/leibri.io/pkg/proto";
 
 // EventStreamMessage is the union type for all messages exchanged
-// between the Master and a Worker.
+// between the Master and a Worker in both directions (symmetric).
 message EventStreamMessage {
   // A unique identifier for the event, used for logging and correlation.
   string event_id = 1;
@@ -23,7 +23,29 @@ message EventStreamMessage {
 
     // ---- Events initiated by the Master ----
     DataAssignmentEvent data_assignment = 7;
+    
+    // ---- Common Events (bidirectional) ----
+    // Used for acknowledgments, control commands, and other flexible message types
+    CommonAckEvent common_ack = 8;
   }
+}
+
+// CommonAckEvent is a unified event type for acknowledgments and control messages.
+// It replaces specific event types like RegistrationAckEvent, HeartbeatAckEvent, etc.
+// with a flexible structure that can represent any acknowledgment or control command.
+message CommonAckEvent {
+  // The server ID of the node sending this acknowledgment
+  string server_id = 1;
+  
+  // The type of event being acknowledged or the command being sent
+  // Examples: "registration_ack", "heartbeat_ack", "evict_epoch", "drain_command"
+  string event_type = 2;
+  
+  // Flexible payload containing event-specific data
+  // For registration_ack: may contain heartbeat_interval_seconds, accepted status
+  // For heartbeat_ack: may contain drain command
+  // For evict_epoch: may contain dataset_id, epoch_id, reason
+  google.protobuf.Struct payload = 3;
 }
 
 message Worker {
@@ -94,6 +116,8 @@ message ResolvedPartition {
   map<string, string> dimension_values = 4;
 }
 
+// DEPRECATED: EventResponse is being phased out in favor of CommonAckEvent within EventStreamMessage
+// for symmetric bidirectional communication. Kept temporarily for backward compatibility.
 message EventResponse {
   string server_id = 1;
   ResponseStatus status = 2;
@@ -102,6 +126,7 @@ message EventResponse {
 
 // ControlPlaneService defines the bidirectional stream for all real-time
 // communication between a Worker and the Master.
+// The stream is now symmetric - both sides send and receive EventStreamMessage.
 service ControlPlaneService {
-  rpc CoordinateWorker(stream EventStreamMessage) returns (stream EventResponse);
+  rpc CoordinateWorker(stream EventStreamMessage) returns (stream EventStreamMessage);
 }
