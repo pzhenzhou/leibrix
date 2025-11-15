@@ -1,53 +1,63 @@
 # Leibrix
 
-A distributed, memory-centric acceleration layer for interactive analytics and operational reporting.
+**Distributed coordination and control plane for the Leibrix memory-centric acceleration layer.**
 
-## Background
+## What is Leibrix?
 
-Modern OLAP systems struggle with performance and scalability challenges as business units increasingly rely on self-service analytics and real-time dashboards. Key issues include:
+Leibrix is the Master component of a distributed in-memory acceleration system for interactive analytics. It serves as
+the **stateful control plane** that orchestrates data placement, lifecycle management, and cluster coordination across a
+pool of Worker nodes.
 
-- **Latency Unpredictability**: Complex SQL queries cause high tail latencies (P95/P99), undermining user trust
-- **Inefficient Multi-Tenancy**: Resource isolation is difficult on shared clusters, leading to "noisy neighbor" problems
-- **High Operational Costs**: Deploying separate clusters per tenant is not scalable or cost-effective
+## Role & Responsibilities
 
-Leibrix addresses these challenges by providing a distributed memory layer that sits above existing lakehouse/OLAP infrastructure, delivering predictable millisecond-level latency with strong multi-tenant isolation.
+- **Cluster Coordination**: Embedded etcd quorum for distributed consensus and leader election
+- **Worker Management**: Health monitoring, registration, and failure handling
+- **Admission Control**: Validates dataset requests, generates LoadPlans, enforces quotas
+- **Data Assignment**: Determines Worker placement for data epochs using configurable strategies
+- **Epoch Lifecycle**: Manages dataset versions from admission through retirement
+- **Multi-Tenant Governance**: Per-tenant resource budgets, admission policies, and isolation
 
 ## Core Features
 
-### Memory-Centric Architecture
-- Materializes immutable, epoched datasets in memory for millisecond-level query latency
-- Leverages embedded DuckDB for vectorized execution and complex SQL capabilities
-- Serves data directly from worker memory with predictable performance
+### Distributed Coordination
 
-### Distributed & Scalable
-- Master-worker architecture with horizontal scaling capability
-- Embedded etcd quorum for distributed coordination and fault tolerance
-- Stateless gateway layer for unified client access and intelligent routing
+- Leader election via embedded etcd for high availability
+- Automatic failover with minimal downtime
+- Consistent state management across Master cluster
 
-### Multi-Tenant Isolation
-- Per-tenant memory and CPU budgets with strict admission control
-- Per-tenant concurrency caps for workload isolation
-- Benefit-driven residency model: admit/evict shards by (saved scan × heat ÷ memory)
+### Intelligent Admission Control
 
-### Immutable Epoch Model
-- Treats datasets as read-only snapshots tied to time windows
-- Simplifies consistency and concurrency management
-- State machine: LOADING → VALIDATING → READY → RETIRING
+- Source-agnostic LoadPlan generation (Iceberg, StarRocks, JDBC)
+- Per-tenant memory and CPU quota enforcement
+- Benefit-driven admission: prioritize hot data by (scan_cost × heat ÷ memory)
 
-### Intelligent Data Flow
-- Notify-pull model: master emits LoadPlans, workers pull and validate
-- Epoch token fencing ensures only READY epochs serve traffic
-- Bounded query execution with fallback to source OLAP systems
+### Worker Orchestration
+
+- Persistent gRPC bidirectional streams for real-time coordination
+- Heartbeat-based liveness detection with automatic rebalancing
+- Graceful drain and shutdown coordination
+
+### Pluggable Assignment Strategies
+
+- Round-robin for homogeneous clusters
+- Hash-based for consistent placement
+- Capacity-aware for heterogeneous environments
 
 ## Architecture
 
-- **Master (Control Plane)**: Manages placement, quotas, epochs, health checks, and worker orchestration
-- **Worker (Data Plane)**: In-memory execution engine with embedded DuckDB for vectorized analytics
-- **Gateway**: Resolves `{tenant, dataset, predicate}` → `{worker, epoch}` and handles routing/failover
+Leibrix is a Go-based service that communicates via gRPC:
+
+- **External API** (`ManagementService`): Unary RPCs for dataset admission and management
+- **Internal API** (`ControlPlaneService`): Event streams for Worker coordination
+- **State Store**: Embedded etcd for cluster state and configuration
+
+## Related Components
+
+- **[leibrix-worker](https://github.com/pzhenzhou/leibrix-worker)**: Memory-centric data plane with embedded DuckDB
+- **leibrix-gateway** (future): Unified query routing layer with MySQL protocol support
 
 ## Limitations
 
-- Not a system of record—the source OLAP/lakehouse remains authoritative
-- Optimized for analytical (OLAP) queries, not transactional (OLTP) workloads
-- Data freshness tied to upstream pipeline completion intervals
-
+- Not a data storage system—delegates actual data serving to Workers
+- Requires at least 3 nodes for production HA (etcd quorum)
+- State migration during version upgrades requires careful planning
