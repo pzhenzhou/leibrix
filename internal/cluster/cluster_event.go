@@ -15,9 +15,9 @@ package cluster
 // Implementation in Leibrix:
 //   - When a leader is elected via etcd, the election key receives a CreateRevision from etcd.
 //   - This CreateRevision is a cluster-wide monotonic counter that serves as the fencing token.
-//   - The token is embedded in LeaderEvent and propagated to all consumers (workers, gateways).
-//   - Workers and gateways compare incoming command epochs against their known current epoch.
-//   - Commands with epoch < current_epoch are REJECTED as stale (from an old leader).
+//   - The token is embedded in LeaderEvent and made available to downstream consumers.
+//   - Consumers that act on leader-issued commands are expected to reject commands whose
+//     epoch is lower than the highest epoch they have already accepted.
 //
 // Example Timeline:
 //  1. Node A elected as leader    → epoch = 100 (from etcd CreateRevision)
@@ -42,8 +42,11 @@ const (
 	EvtLeaderExpired  EventType = "leader-expired"
 
 	// Membership Events
-	EvtMemberJoined  EventType = "member-joined"
-	EvtMemberLeft    EventType = "member-left"
+	EvtMemberJoined EventType = "member-joined"
+	EvtMemberLeft   EventType = "member-left"
+	// EvtMemberExpired is reserved for a future implementation that can classify whether
+	// a member key disappeared because its lease expired rather than because it was removed
+	// explicitly. The current etcd watch path only emits EvtMemberLeft for delete events.
 	EvtMemberExpired EventType = "member-expired"
 	EvtMemberUpdated EventType = "member-updated"
 )
@@ -82,8 +85,11 @@ type Event struct {
 // Listener is the interface that the MembershipListener will implement.
 // The existing Election service will push events to this interface.
 type Listener interface {
-	// OnLeaderChange is called when a leader is elected, resigns, or expires.
+	// OnLeaderChange is called when a leader is elected and when the local leader term
+	// ends due to either explicit resignation or session expiration.
 	OnLeaderChange(ev LeaderEvent)
-	// OnMembershipChange is called when a member joins, leaves, is updated, or expires.
+	// OnMembershipChange is called when a member joins, leaves, or is updated.
+	// Delete events are currently surfaced as EvtMemberLeft because etcd's watch stream
+	// does not expose whether the deletion came from lease expiration or explicit removal.
 	OnMembershipChange(ev MembershipEvent)
 }

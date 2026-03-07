@@ -20,6 +20,7 @@ const (
 	membersKey        = "/leibri.io/cluster/members/"
 	sessionTTL        = 15
 	leaderChangeRetry = 5 * time.Second
+	listenerQueueSize = 16
 )
 
 type MemberRole string
@@ -41,6 +42,7 @@ type MemberNode struct {
 
 type sink struct {
 	ch   chan any
+	done chan struct{}
 	once sync.Once
 }
 
@@ -59,27 +61,28 @@ type LeibrixLeaderElection struct {
 	// This ensures atomic lifecycle assignment and automatic cleanup
 
 	// shutdown
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	cancel     context.CancelFunc
+	serviceWg  sync.WaitGroup
+	listenerWg sync.WaitGroup
 
 	lock           sync.Mutex
 	nextListenerID uint64
+	currentLeader  string
 	//logger         *zap.Logger
 }
 
 func NewLeaderElection(config *conf.LeibrixConfig) (*LeibrixLeaderElection, error) {
-
 	innerLogger, initLoggerErr := common.BuildZapLogger()
 	if initLoggerErr != nil {
-		panic(initLoggerErr)
+		return nil, fmt.Errorf("failed to initialize election logger: %w", initLoggerErr)
 	}
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints: config.ClusterConfig.ListenClientUrls,
-		Logger:    innerLogger,
-	})
+	clientConfig := common.DefaultEtcdClientConfig(config.ClusterConfig.ListenClientUrls)
+	clientConfig.Logger = innerLogger
+
+	cli, err := clientv3.New(clientConfig)
 	if err != nil {
 		logger.Error(err, "Failed to create etcd client", "node", config.Node.NodeName)
-		panic(err)
+		return nil, fmt.Errorf("failed to create etcd client: %w", err)
 	}
 	node := &MemberNode{
 		Name:          config.Node.NodeName,
@@ -98,7 +101,9 @@ func NewLeaderElection(config *conf.LeibrixConfig) (*LeibrixLeaderElection, erro
 
 func (l *LeibrixLeaderElection) Start(ctx context.Context) error {
 	logger.Info("starting leader election service", "node", l.myNode.Name)
-	session, err := concurrencyv3.NewSession(l.client, concurrencyv3.WithTTL(sessionTTL))
+	session, err := concurrencyv3.NewSession(l.client,
+		concurrencyv3.WithTTL(sessionTTL),
+		concurrencyv3.WithContext(ctx))
 	if err != nil {
 		logger.Error(err, fmt.Sprintf("failed to create etcd session for leader election service: %s", l.myNode.Name))
 		return err
@@ -106,22 +111,25 @@ func (l *LeibrixLeaderElection) Start(ctx context.Context) error {
 	l.session = session
 	l.election = concurrencyv3.NewElection(session, electionKey)
 
+	parentCtx, cancel := context.WithCancel(ctx)
+	l.cancel = cancel
+	memberWatchChan := l.client.Watch(parentCtx, membersKey, clientv3.WithPrefix(), clientv3.WithPrevKV())
+
 	if registerErr := l.registerMember(ctx); registerErr != nil {
 		logger.Error(registerErr, fmt.Sprintf("failed to register leader election service: %s", l.myNode.Name))
+		cancel()
+		_ = session.Close()
 		return registerErr
 	}
 
-	parentCtx, cancel := context.WithCancel(ctx)
-	l.cancel = cancel
-
-	l.wg.Add(1)
+	l.serviceWg.Add(1)
 	go l.campaign(parentCtx)
 
-	l.wg.Add(1)
+	l.serviceWg.Add(1)
 	go l.observeLeader(parentCtx)
 
-	l.wg.Add(1)
-	go l.observeMembers(parentCtx)
+	l.serviceWg.Add(1)
+	go l.observeMembers(memberWatchChan)
 
 	logger.Info("leader election service started", "node", l.myNode.Name)
 	return nil
@@ -130,11 +138,9 @@ func (l *LeibrixLeaderElection) Start(ctx context.Context) error {
 func (l *LeibrixLeaderElection) Close() error {
 	logger.Info("stopping leader election service", "node", l.myNode.Name)
 
-	// Check if cancel was initialized before calling
-	// cancel is only set in Start(), so Close() before Start() would cause panic
 	if l.cancel != nil {
 		l.cancel()
-		l.wg.Wait()
+		l.serviceWg.Wait()
 	}
 
 	// Session.Close() automatically revokes its lease, which cleans up:
@@ -149,8 +155,14 @@ func (l *LeibrixLeaderElection) Close() error {
 		}
 	}
 
+	l.closeAllListeners()
+	l.listenerWg.Wait()
+
 	logger.Info("leader election service stopped")
-	return l.client.Close()
+	if l.client != nil {
+		return l.client.Close()
+	}
+	return nil
 }
 
 func (l *LeibrixLeaderElection) registerMember(ctx context.Context) error {
@@ -191,46 +203,17 @@ func (l *LeibrixLeaderElection) registerMember(ctx context.Context) error {
 // The session's internal keepalive mechanism now handles both
 // the election lease and member registration lease automatically.
 
-func (l *LeibrixLeaderElection) observeMembers(ctx context.Context) {
-	defer l.wg.Done()
-
-	watchChan := l.client.Watch(ctx, membersKey, clientv3.WithPrefix())
+func (l *LeibrixLeaderElection) observeMembers(watchChan clientv3.WatchChan) {
+	defer l.serviceWg.Done()
 
 	for resp := range watchChan {
 		for _, event := range resp.Events {
-			var eventType EventType
-			var member MemberNode
-
-			key := event.Kv.Key
-			value := event.Kv.Value
-
-			switch event.Type {
-			case clientv3.EventTypePut:
-				if event.IsCreate() {
-					eventType = EvtMemberJoined
-				} else {
-					eventType = EvtMemberUpdated
-				}
-			case clientv3.EventTypeDelete:
-				eventType = EvtMemberLeft
-				// For deletes, the value is gone, so we must use the previous value.
-				value = event.PrevKv.Value
-				key = event.PrevKv.Key
-			}
-
-			if err := json.Unmarshal(value, &member); err != nil {
-				logger.Error(err, "failed to unmarshal member data", "node", l.myNode.Name)
+			membershipEvent, err := buildMembershipEvent(event)
+			if err != nil {
+				logger.Error(err, "failed to decode membership event", "node", l.myNode.Name)
 				continue
 			}
-			// Fallback to key if name is not in value
-			if member.Name == "" {
-				member.Name = string(key)
-			}
-
-			l.broadcastMembershipEvent(MembershipEvent{
-				Type:   eventType,
-				Member: &member,
-			})
+			l.broadcastMembershipEvent(membershipEvent)
 		}
 	}
 }
@@ -245,9 +228,7 @@ func (l *LeibrixLeaderElection) broadcastLeaderEvent(ev LeaderEvent) {
 
 	logger.Info("broadcasting leader event", "type", string(ev.Type), "leader", ev.Member.Name)
 	for _, s := range sinksToNotify {
-		select {
-		case s.ch <- ev:
-		default:
+		if !s.trySend(ev) {
 			logger.Info("listener channel full, dropping leader event")
 		}
 	}
@@ -263,9 +244,7 @@ func (l *LeibrixLeaderElection) broadcastMembershipEvent(ev MembershipEvent) {
 
 	logger.Info("broadcasting membership event", "type", string(ev.Type), "member", ev.Member.Name)
 	for _, s := range sinksToNotify {
-		select {
-		case s.ch <- ev:
-		default:
+		if !s.trySend(ev) {
 			logger.Info("listener channel full, dropping membership event")
 		}
 	}
@@ -273,14 +252,20 @@ func (l *LeibrixLeaderElection) broadcastMembershipEvent(ev MembershipEvent) {
 
 // campaign actively competes to become the leader. Only the winning node's
 // Campaign() call will unblock. The loser's call will block until the leader
-// fails. This goroutine is responsible for executing leader-specific logic
-// upon winning the election.
+// fails. This goroutine is also responsible for classifying how the local
+// leadership term ends so consumers can distinguish graceful resignation from
+// session expiration.
 func (l *LeibrixLeaderElection) campaign(ctx context.Context) {
-	defer l.wg.Done()
+	defer l.serviceWg.Done()
 	for {
 		select {
 		case <-ctx.Done():
-			l.resign(context.Background())
+			if l.IsLeader() {
+				if err := l.resign(context.Background()); err != nil {
+					logger.Error(err, "failed to resign leadership", "node", l.myNode.Name)
+				}
+				l.loseLeadership(EvtLeaderResigned)
+			}
 			return
 		default:
 		}
@@ -303,7 +288,7 @@ func (l *LeibrixLeaderElection) campaign(ctx context.Context) {
 		select {
 		case <-l.session.Done():
 			logger.Info("leader session expired", "node", l.myNode.Name)
-			l.loseLeadership()
+			l.loseLeadership(EvtLeaderExpired)
 		case <-ctx.Done():
 			logger.Info("context cancelled, resigning leadership", "node", l.myNode.Name)
 		}
@@ -316,7 +301,7 @@ func (l *LeibrixLeaderElection) campaign(ctx context.Context) {
 // of who the current leader is, ensuring a consistent view of the cluster state.
 // This is the primary mechanism for followers to learn about the current leader.
 func (l *LeibrixLeaderElection) observeLeader(ctx context.Context) {
-	defer l.wg.Done()
+	defer l.serviceWg.Done()
 
 	ch := l.election.Observe(ctx)
 	for {
@@ -334,6 +319,7 @@ func (l *LeibrixLeaderElection) observeLeader(ctx context.Context) {
 				} else {
 					l.myNode.Role = Follower
 				}
+				l.currentLeader = leaderName
 				l.lock.Unlock()
 
 				logger.Info("observed new leader", "leader", leaderName)
@@ -362,17 +348,20 @@ func (l *LeibrixLeaderElection) becomeLeader() {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 	l.myNode.Role = Leader
+	l.currentLeader = l.myNode.Name
 }
 
-func (l *LeibrixLeaderElection) loseLeadership() {
+func (l *LeibrixLeaderElection) loseLeadership(eventType EventType) {
 	l.lock.Lock()
-	defer l.lock.Unlock()
 	l.myNode.Role = Candidate
+	l.currentLeader = ""
+	nodeName := l.config.Node.NodeName
+	l.lock.Unlock()
 
 	ev := LeaderEvent{
-		Type: EvtLeaderResigned,
+		Type: eventType,
 		Member: &MemberNode{
-			Name: l.config.Node.NodeName,
+			Name: nodeName,
 		},
 	}
 	l.broadcastLeaderEvent(ev)
@@ -388,7 +377,7 @@ func (l *LeibrixLeaderElection) resign(ctx context.Context) error {
 
 func (l *LeibrixLeaderElection) Watch(listener Listener) (unwatch func()) {
 	id := atomic.AddUint64(&l.nextListenerID, 1)
-	s := &sink{ch: make(chan any, 1)} // Buffered channel of 1 to decouple broadcaster
+	s := newSink()
 
 	// register
 	l.lock.Lock()
@@ -396,26 +385,26 @@ func (l *LeibrixLeaderElection) Watch(listener Listener) (unwatch func()) {
 	l.lock.Unlock()
 
 	// single goroutine per listener: invokes blocking callbacks serially
-	l.wg.Add(1)
+	l.listenerWg.Add(1)
 	go func() {
-		defer l.wg.Done()
-		for ev := range s.ch {
-			switch v := ev.(type) {
-			case LeaderEvent:
-				listener.OnLeaderChange(v) // BLOCKING by design
-			case MembershipEvent:
-				listener.OnMembershipChange(v) // BLOCKING by design
+		defer l.listenerWg.Done()
+		for {
+			select {
+			case <-s.done:
+				return
+			case ev := <-s.ch:
+				switch v := ev.(type) {
+				case LeaderEvent:
+					listener.OnLeaderChange(v) // BLOCKING by design
+				case MembershipEvent:
+					listener.OnMembershipChange(v) // BLOCKING by design
+				}
 			}
 		}
 	}()
 
 	return func() {
-		l.lock.Lock()
-		if old, ok := l.listeners[id]; ok {
-			delete(l.listeners, id)
-			old.once.Do(func() { close(old.ch) })
-		}
-		l.lock.Unlock()
+		l.removeListener(id)
 	}
 }
 
@@ -436,4 +425,121 @@ func (l *LeibrixLeaderElection) Members() ([]*MemberNode, error) {
 		members = append(members, &member)
 	}
 	return members, nil
+}
+
+func (l *LeibrixLeaderElection) IsLeader() bool {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	return l.myNode != nil && l.myNode.Role == Leader
+}
+
+func (l *LeibrixLeaderElection) LeaderName() string {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	return l.currentLeader
+}
+
+func (l *LeibrixLeaderElection) closeAllListeners() {
+	l.lock.Lock()
+	listeners := make([]*sink, 0, len(l.listeners))
+	for id, listener := range l.listeners {
+		delete(l.listeners, id)
+		listeners = append(listeners, listener)
+	}
+	l.lock.Unlock()
+
+	for _, listener := range listeners {
+		listener.close()
+	}
+}
+
+func (l *LeibrixLeaderElection) removeListener(id uint64) {
+	l.lock.Lock()
+	listener, ok := l.listeners[id]
+	if ok {
+		delete(l.listeners, id)
+	}
+	l.lock.Unlock()
+
+	if ok {
+		listener.close()
+	}
+}
+
+func newSink() *sink {
+	return &sink{
+		ch:   make(chan any, listenerQueueSize),
+		done: make(chan struct{}),
+	}
+}
+
+func (s *sink) close() {
+	s.once.Do(func() {
+		close(s.done)
+	})
+}
+
+func (s *sink) trySend(ev any) bool {
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+
+	select {
+	case s.ch <- ev:
+		return true
+	case <-s.done:
+		return false
+	default:
+		return false
+	}
+}
+
+func buildMembershipEvent(event *clientv3.Event) (MembershipEvent, error) {
+	member := &MemberNode{}
+	eventType := EvtMemberUpdated
+	key := []byte(nil)
+	value := []byte(nil)
+
+	switch event.Type {
+	case clientv3.EventTypePut:
+		if event.IsCreate() {
+			eventType = EvtMemberJoined
+		}
+		key = event.Kv.Key
+		value = event.Kv.Value
+	case clientv3.EventTypeDelete:
+		eventType = EvtMemberLeft
+		if event.PrevKv != nil {
+			key = event.PrevKv.Key
+			value = event.PrevKv.Value
+		} else if event.Kv != nil {
+			key = event.Kv.Key
+		}
+	default:
+		return MembershipEvent{}, fmt.Errorf("unsupported event type: %v", event.Type)
+	}
+
+	if len(value) > 0 {
+		if err := json.Unmarshal(value, member); err != nil {
+			return MembershipEvent{}, err
+		}
+	}
+
+	if member.Name == "" {
+		member.Name = memberNameFromKey(string(key))
+	}
+
+	return MembershipEvent{
+		Type:   eventType,
+		Member: member,
+	}, nil
+}
+
+func memberNameFromKey(key string) string {
+	if len(key) <= len(membersKey) {
+		return key
+	}
+	return key[len(membersKey):]
 }

@@ -52,11 +52,11 @@ func (d *EventDispatcher) Dispatch(ctx context.Context, eventType EventType, eve
 }
 
 func RegisterAllEventHandlers(dispatcher *EventDispatcher, config *conf.LeibrixConfig) {
+	stateStore := NewControlPlaneStateStore()
+
 	// Register heartbeat handler
 	dispatcher.Register(EventTypeHeartbeat, NewHeartbeatHandler(config.Node.NodeName))
-
-	// TODO: Register other handlers as they are implemented
-	// dispatcher.Register(EventTypeRegister, NewRegisterHandler(config))
-	// dispatcher.Register(EventTypeDataPullState, NewDataPullStateHandler(config))
-	// dispatcher.Register(EventTypeDataAssigment, NewDataAssignmentHandler(config))
+	dispatcher.Register(EventTypeRegister, NewRegisterHandler(config.Node.NodeName, stateStore))
+	dispatcher.Register(EventTypeDataPullState, NewDataPullStateHandler(config.Node.NodeName, stateStore))
+	dispatcher.Register(EventTypeCommonAck, NewCommonAckHandler(config.Node.NodeName, stateStore))
 }

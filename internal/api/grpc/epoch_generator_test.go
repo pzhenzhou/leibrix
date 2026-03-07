@@ -412,3 +412,110 @@ func TestEpochGenerator_TruncateToGranularity(t *testing.T) {
 		})
 	}
 }
+
+func TestEpochGenerator_GenerateEpochs_DefaultsToDailyWithoutSourceGranularity(t *testing.T) {
+	generator := &EpochGenerator{}
+	start := time.Date(2023, 11, 1, 9, 15, 0, 0, time.UTC)
+	end := time.Date(2023, 11, 2, 3, 0, 0, 0, time.UTC)
+
+	request := &myproto.AdmitDatasetRequest{
+		TenantId:  "tenant-123",
+		DatasetId: "dataset-456",
+		Source: &myproto.DataSource{
+			Partition: &myproto.Partition{
+				TimePartition: &myproto.TimePartition{
+					Column: &myproto.PartitionColumn{
+						Name: "event_time",
+						Type: myproto.PartitionColumn_TIMESTAMP,
+					},
+					Filter: &myproto.TimeRangeFilter{
+						StartInclusive: timestamppb.New(start),
+						EndExclusive:   timestamppb.New(end),
+					},
+				},
+			},
+		},
+	}
+
+	epochs, err := generator.GenerateEpochs(request)
+	if err != nil {
+		t.Fatalf("GenerateEpochs failed: %v", err)
+	}
+
+	if len(epochs) != 2 {
+		t.Fatalf("expected 2 daily epochs, got %d", len(epochs))
+	}
+	if got := epochs[0].TimeRange.StartInclusive.AsTime(); !got.Equal(time.Date(2023, 11, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("expected first epoch to be truncated to midnight, got %v", got)
+	}
+}
+
+func TestEpochGenerator_GenerateEpochs_CreatesDimensionCrossProduct(t *testing.T) {
+	generator := &EpochGenerator{}
+	start := time.Date(2023, 10, 25, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2023, 10, 26, 0, 0, 0, 0, time.UTC)
+
+	request := &myproto.AdmitDatasetRequest{
+		TenantId:  "tenant-123",
+		DatasetId: "dataset-456",
+		Source: &myproto.DataSource{
+			Partition: &myproto.Partition{
+				TimePartition: &myproto.TimePartition{
+					Filter: &myproto.TimeRangeFilter{
+						StartInclusive: timestamppb.New(start),
+						EndExclusive:   timestamppb.New(end),
+					},
+				},
+				DimensionPartitions: []*myproto.DimensionPartition{
+					{
+						Column: &myproto.PartitionColumn{Name: "country", Type: myproto.PartitionColumn_STRING},
+						Values: &myproto.PartitionValues{Values: []string{"US", "CA"}},
+					},
+					{
+						Column: &myproto.PartitionColumn{Name: "region", Type: myproto.PartitionColumn_STRING},
+						Values: &myproto.PartitionValues{Values: []string{"east", "west"}},
+					},
+				},
+			},
+		},
+	}
+
+	epochs, err := generator.GenerateEpochs(request)
+	if err != nil {
+		t.Fatalf("GenerateEpochs failed: %v", err)
+	}
+
+	if len(epochs) != 4 {
+		t.Fatalf("expected 4 epochs from 2x2 dimension cross-product, got %d", len(epochs))
+	}
+
+	combinations := map[string]bool{}
+	for _, epoch := range epochs {
+		key := epoch.DimensionValues["country"] + "/" + epoch.DimensionValues["region"]
+		combinations[key] = true
+	}
+
+	for _, combination := range []string{"US/east", "US/west", "CA/east", "CA/west"} {
+		if !combinations[combination] {
+			t.Fatalf("missing dimension combination %s", combination)
+		}
+	}
+}
+
+func TestEpochGenerator_GenerateEpochs_UsesDeterministicDimensionHashing(t *testing.T) {
+	generator := &EpochGenerator{}
+	start := time.Date(2023, 10, 25, 0, 0, 0, 0, time.UTC)
+
+	idA := generator.generateEpochID(start, map[string]string{
+		"country": "US",
+		"region":  "west",
+	})
+	idB := generator.generateEpochID(start, map[string]string{
+		"region":  "west",
+		"country": "US",
+	})
+
+	if idA != idB {
+		t.Fatalf("expected deterministic epoch IDs, got %q and %q", idA, idB)
+	}
+}

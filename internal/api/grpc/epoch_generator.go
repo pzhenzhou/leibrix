@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"time"
 
 	myproto "github.com/pzhenzhou/leibri.io/pkg/proto"
@@ -17,7 +18,7 @@ type EpochGenerator struct{}
 // It follows these rules:
 // 1. Extract the time range from request.source.partition.time_partition.filter
 // 2. If epoch_granularity is specified, slice the time range accordingly
-// 3. If not specified, default to 1:1 mapping (would require source introspection in real impl)
+// 3. If not specified, derive from source granularity or fall back to 1 DAY
 // 4. Always align to calendar boundaries (no partial days/hours/etc)
 func (eg *EpochGenerator) GenerateEpochs(request *myproto.AdmitDatasetRequest) ([]*myproto.EpochInfo, error) {
 	timeRange, err := eg.extractTimeRange(request)
@@ -28,10 +29,14 @@ func (eg *EpochGenerator) GenerateEpochs(request *myproto.AdmitDatasetRequest) (
 	if granularity == nil {
 		return nil, fmt.Errorf("failed to determine epoch granularity")
 	}
-	dimensionValues := eg.extractDimensionValues(request)
-	epochs, err := eg.sliceTimeRange(timeRange, granularity, dimensionValues)
-	if err != nil {
-		return nil, fmt.Errorf("failed to slice time range: %w", err)
+	dimensionValueSets := eg.extractDimensionValueSets(request)
+	var epochs []*myproto.EpochInfo
+	for _, dimensionValues := range dimensionValueSets {
+		dimensionEpochs, err := eg.sliceTimeRange(timeRange, granularity, dimensionValues)
+		if err != nil {
+			return nil, fmt.Errorf("failed to slice time range: %w", err)
+		}
+		epochs = append(epochs, dimensionEpochs...)
 	}
 	return epochs, nil
 }
@@ -50,7 +55,8 @@ func (eg *EpochGenerator) extractTimeRange(request *myproto.AdmitDatasetRequest)
 
 // determineGranularity returns the epoch granularity.
 // If request.EpochGranularity is set, use it.
-// Otherwise, derive from source partition's source_granularity (1:1 mapping).
+// Otherwise, derive from source partition's source_granularity (1:1 mapping),
+// falling back to 1 DAY when the source does not declare one.
 func (eg *EpochGenerator) determineGranularity(request *myproto.AdmitDatasetRequest) *myproto.EpochGranularity {
 	// If explicitly specified, use it
 	if request.EpochGranularity != nil {
@@ -65,7 +71,10 @@ func (eg *EpochGenerator) determineGranularity(request *myproto.AdmitDatasetRequ
 	if timePartition.Column != nil && timePartition.Column.SourceGranularity != nil {
 		return eg.convertSourceGranularity(*timePartition.Column.SourceGranularity)
 	}
-	return nil
+	return &myproto.EpochGranularity{
+		Value: 1,
+		Unit:  myproto.EpochGranularity_DAY,
+	}
 }
 
 // convertSourceGranularity converts PartitionColumn_Granularity to EpochGranularity
@@ -100,20 +109,30 @@ func (eg *EpochGenerator) convertSourceGranularity(sourceGranularity myproto.Par
 	}
 }
 
-// extractDimensionValues builds a map of dimension partition values
-func (eg *EpochGenerator) extractDimensionValues(request *myproto.AdmitDatasetRequest) map[string]string {
-	dimensionValues := make(map[string]string)
+// extractDimensionValueSets creates the cross-product of all dimension partition values.
+func (eg *EpochGenerator) extractDimensionValueSets(request *myproto.AdmitDatasetRequest) []map[string]string {
+	dimensionValueSets := []map[string]string{{}}
 	if request.Source == nil || request.Source.Partition == nil {
-		return dimensionValues
+		return dimensionValueSets
 	}
+
 	for _, dimPartition := range request.Source.Partition.DimensionPartitions {
-		if dimPartition.Column != nil && dimPartition.Values != nil && len(dimPartition.Values.Values) > 0 {
-			// For simplicity, use the first value. In a real implementation,
-			// you'd create cross-product of all dimension combinations
-			dimensionValues[dimPartition.Column.Name] = dimPartition.Values.Values[0]
+		if dimPartition.Column == nil || dimPartition.Values == nil || len(dimPartition.Values.Values) == 0 {
+			continue
 		}
+
+		nextSets := make([]map[string]string, 0, len(dimensionValueSets)*len(dimPartition.Values.Values))
+		for _, existing := range dimensionValueSets {
+			for _, value := range dimPartition.Values.Values {
+				newSet := cloneDimensionValues(existing)
+				newSet[dimPartition.Column.Name] = value
+				nextSets = append(nextSets, newSet)
+			}
+		}
+		dimensionValueSets = nextSets
 	}
-	return dimensionValues
+
+	return dimensionValueSets
 }
 
 // sliceTimeRange divides the time range into epochs based on the granularity
@@ -141,7 +160,7 @@ func (eg *EpochGenerator) sliceTimeRange(
 				StartInclusive: timestamppb.New(current),
 				EndExclusive:   timestamppb.New(epochEnd),
 			},
-			DimensionValues: dimensionValues,
+			DimensionValues: cloneDimensionValues(dimensionValues),
 		}
 		epochs = append(epochs, epoch)
 		current = epochEnd
@@ -206,11 +225,29 @@ func (eg *EpochGenerator) generateEpochID(start time.Time, dimensionValues map[s
 	// Create a deterministic hash from timestamp + dimensions
 	hasher := sha256.New()
 	hasher.Write([]byte(fmt.Sprintf("%d", timestampMs)))
-	for key, value := range dimensionValues {
+	keys := make([]string, 0, len(dimensionValues))
+	for key := range dimensionValues {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := dimensionValues[key]
 		hasher.Write([]byte(fmt.Sprintf("%s=%s", key, value)))
 	}
 	hashBytes := hasher.Sum(nil)
 	hashSuffix := hex.EncodeToString(hashBytes[:3]) // Use first 3 bytes (6 hex chars)
 
 	return fmt.Sprintf("%d_%s", timestampMs, hashSuffix)
+}
+
+func cloneDimensionValues(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return map[string]string{}
+	}
+
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }

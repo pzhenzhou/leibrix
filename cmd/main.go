@@ -93,7 +93,7 @@ func startServices(ctx context.Context, configObj *conf.LeibrixConfig) (
 
 	// Start gRPC server
 	logger.Info("Starting gRPC server", "node", configObj.Node.NodeName)
-	grpcServer, err := grpc.NewGRPCServer(configObj)
+	grpcServer, err := grpc.NewGRPCServer(configObj, election)
 	if err != nil {
 		_ = nodeServer.Stop(context.Background()) // Cleanup
 		_ = election.Close()
