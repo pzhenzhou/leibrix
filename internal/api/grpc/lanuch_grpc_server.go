@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pzhenzhou/leibri.io/internal/api/grpc/events"
+	"github.com/pzhenzhou/leibri.io/internal/cluster"
 	"github.com/pzhenzhou/leibri.io/internal/conf"
 	"github.com/pzhenzhou/leibri.io/pkg/common"
 	myproto "github.com/pzhenzhou/leibri.io/pkg/proto"
@@ -47,15 +48,16 @@ type LeibrixGRPCServer struct {
 	managementSvc   myproto.ManagementServiceServer
 	controlPlaneSvc myproto.ControlPlaneServiceServer
 	sessionManager  *events.SessionManager
+	leadership      LeadershipProvider
+	leadershipStop  func()
 	listenAddr      string
 }
 
-// NewGRPCServer creates a new gRPC server instance
-func NewGRPCServer(config *conf.LeibrixConfig) (*LeibrixGRPCServer, error) {
+func NewGRPCServer(config *conf.LeibrixConfig, leadership LeadershipProvider) (*LeibrixGRPCServer, error) {
 	grpcServer := grpc.NewServer(grpcOpts...)
 
 	// Initialize ManagementService
-	managementSvc, err := NewManagementService(config)
+	managementSvc, err := NewManagementService(config, leadership)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ManagementService: %w", err)
 	}
@@ -65,7 +67,7 @@ func NewGRPCServer(config *conf.LeibrixConfig) (*LeibrixGRPCServer, error) {
 	// Initialize ControlPlaneService
 	sessionManager := events.NewSessionManager()
 	dispatcher := events.NewEventDispatcher()
-	controlPlaneSvc := NewControlPlaneService(config, dispatcher, sessionManager)
+	controlPlaneSvc := NewControlPlaneService(config, dispatcher, sessionManager, leadership)
 	myproto.RegisterControlPlaneServiceServer(grpcServer, controlPlaneSvc)
 	logger.Info("ControlPlaneService registered successfully")
 
@@ -88,12 +90,16 @@ func NewGRPCServer(config *conf.LeibrixConfig) (*LeibrixGRPCServer, error) {
 		managementSvc:   managementSvc,
 		controlPlaneSvc: controlPlaneSvc,
 		sessionManager:  sessionManager,
+		leadership:      leadership,
 		listenAddr:      listenAddr,
 	}, nil
 }
 
 // Start starts the gRPC server and blocks until context is cancelled
 func (s *LeibrixGRPCServer) Start(ctx context.Context) error {
+	s.setServingState(s.leadership == nil || s.leadership.IsLeader())
+	s.registerLeadershipWatcher()
+
 	logger.Info("Starting Leibrix Master gRPC server",
 		"address", s.listenAddr,
 		"node", s.config.Node.NodeName)
@@ -125,8 +131,8 @@ func (s *LeibrixGRPCServer) Start(ctx context.Context) error {
 func (s *LeibrixGRPCServer) Shutdown(ctx context.Context) error {
 	logger.Info("Shutting down gRPC server...")
 
-	s.healthServer.SetServingStatus("leibrix.ManagementService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
-	s.healthServer.SetServingStatus("leibrix.ControlPlaneService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	s.unregisterLeadershipWatcher()
+	s.setServingState(false)
 
 	// Close all active sessions
 	if s.sessionManager != nil {
@@ -161,8 +167,7 @@ func (s *LeibrixGRPCServer) Shutdown(ctx context.Context) error {
 // initiateShutdown marks the service as not serving and closes connections
 // This is a non-blocking operation that prepares for shutdown
 func (s *LeibrixGRPCServer) initiateShutdown() {
-	s.healthServer.SetServingStatus("leibrix.ManagementService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
-	s.healthServer.SetServingStatus("leibrix.ControlPlaneService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	s.setServingState(false)
 }
 
 // Stop immediately stops the gRPC server
@@ -170,9 +175,56 @@ func (s *LeibrixGRPCServer) Stop() {
 	s.grpcServer.Stop()
 }
 
+func (s *LeibrixGRPCServer) setServingState(serving bool) {
+	status := grpc_health_v1.HealthCheckResponse_NOT_SERVING
+	if serving {
+		status = grpc_health_v1.HealthCheckResponse_SERVING
+	}
+	s.healthServer.SetServingStatus("leibrix.ManagementService", status)
+	s.healthServer.SetServingStatus("leibrix.ControlPlaneService", status)
+}
+
+func (s *LeibrixGRPCServer) registerLeadershipWatcher() {
+	if s.leadership == nil || s.leadershipStop != nil {
+		return
+	}
+
+	s.leadershipStop = s.leadership.Watch(&grpcLeadershipListener{server: s})
+}
+
+func (s *LeibrixGRPCServer) unregisterLeadershipWatcher() {
+	if s.leadershipStop != nil {
+		s.leadershipStop()
+		s.leadershipStop = nil
+	}
+}
+
+func (s *LeibrixGRPCServer) handleLeaderEvent(ev cluster.LeaderEvent) {
+	isLocalLeader := ev.Member != nil && ev.Member.Name == s.config.Node.NodeName
+	if ev.Type == cluster.EvtLeaderElected && isLocalLeader {
+		s.setServingState(true)
+		return
+	}
+
+	s.setServingState(false)
+	if s.sessionManager != nil {
+		s.sessionManager.Close()
+	}
+}
+
+type grpcLeadershipListener struct {
+	server *LeibrixGRPCServer
+}
+
+func (l *grpcLeadershipListener) OnLeaderChange(ev cluster.LeaderEvent) {
+	l.server.handleLeaderEvent(ev)
+}
+
+func (*grpcLeadershipListener) OnMembershipChange(cluster.MembershipEvent) {}
+
 // LeibrixMasterGRPCServer launches the gRPC server for the Leibrix Master node.
 func LeibrixMasterGRPCServer(config *conf.LeibrixConfig) error {
-	server, err := NewGRPCServer(config)
+	server, err := NewGRPCServer(config, nil)
 	if err != nil {
 		return err
 	}

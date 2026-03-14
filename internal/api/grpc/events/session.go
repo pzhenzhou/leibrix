@@ -59,7 +59,15 @@ func (s *Session) drainOutbox() {
 }
 
 // Send enqueues an event message to be sent to the client
-func (s *Session) Send(msg *myproto.EventStreamMessage) error {
+func (s *Session) Send(msg *myproto.EventStreamMessage) (err error) {
+	if atomic.LoadInt32(&s.closed) == SessionClosed {
+		return fmt.Errorf("session closed")
+	}
+	defer func() {
+		if recover() != nil {
+			err = fmt.Errorf("session closed")
+		}
+	}()
 	select {
 	case s.outbox <- msg:
 		return nil
@@ -79,7 +87,10 @@ func (s *Session) writerLoop() {
 		case <-s.ctx.Done():
 			s.drainOutbox()
 			return
-		case resp := <-s.outbox:
+		case resp, ok := <-s.outbox:
+			if !ok {
+				return
+			}
 			if err := s.stream.Send(resp); err != nil {
 				logger.Error(err, "send response error", "server_id", s.ServerId)
 				s.Close()
@@ -97,4 +108,8 @@ func (s *Session) Close() {
 	} else {
 		logger.Info("Session already closed", "server_id", s.ServerId)
 	}
+}
+
+func (s *Session) Done() <-chan struct{} {
+	return s.ctx.Done()
 }

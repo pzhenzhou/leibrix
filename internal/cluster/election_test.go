@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pzhenzhou/leibri.io/internal/conf"
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	concurrencyv3 "go.etcd.io/etcd/client/v3/concurrency"
 	"go.etcd.io/etcd/server/v3/embed"
@@ -25,6 +26,32 @@ type TestListener struct {
 	memberCallCount  atomic.Int32
 	wg               sync.WaitGroup
 	expectingEvents  bool // Track whether ExpectEvents() was called
+}
+
+type blockingListener struct {
+	membershipStarted chan struct{}
+	releaseMembership chan struct{}
+	leaderEvents      chan LeaderEvent
+}
+
+func newBlockingListener() *blockingListener {
+	return &blockingListener{
+		membershipStarted: make(chan struct{}, 1),
+		releaseMembership: make(chan struct{}),
+		leaderEvents:      make(chan LeaderEvent, 1),
+	}
+}
+
+func (l *blockingListener) OnLeaderChange(ev LeaderEvent) {
+	l.leaderEvents <- ev
+}
+
+func (l *blockingListener) OnMembershipChange(MembershipEvent) {
+	select {
+	case l.membershipStarted <- struct{}{}:
+	default:
+	}
+	<-l.releaseMembership
 }
 
 func NewTestListener() *TestListener {
@@ -243,15 +270,145 @@ func TestNewLeaderElection_InvalidEndpoint(t *testing.T) {
 	defer election.Close() // Use defer to ensure cleanup always happens
 
 	// Start should fail with invalid endpoint
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
+	startedAt := time.Now()
 	err = election.Start(ctx)
+	elapsed := time.Since(startedAt)
 	if err == nil {
 		t.Error("Expected error when starting with invalid endpoint")
 	} else {
 		// Expected case: connection should fail
 		t.Logf("Got expected error: %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Start(ctx) ignored caller deadline; returned after %v", elapsed)
+	}
+}
+
+func TestLoseLeadershipDoesNotDeadlock(t *testing.T) {
+	listener := NewTestListener()
+	election := &LeibrixLeaderElection{
+		config:    createTestConfig("test-node", "http://localhost:2379"),
+		myNode:    &MemberNode{Name: "test-node", Role: Leader},
+		listeners: make(map[uint64]*sink),
+	}
+	unwatch := election.Watch(listener)
+	defer unwatch()
+	listener.ExpectEvents(1, 0)
+
+	done := make(chan struct{})
+	go func() {
+		election.loseLeadership(EvtLeaderExpired)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("loseLeadership deadlocked")
+	}
+
+	if election.myNode.Role != Candidate {
+		t.Fatalf("expected role to be %s, got %s", Candidate, election.myNode.Role)
+	}
+	if !listener.WaitForEvents(1 * time.Second) {
+		t.Fatal("expected leader expiration event")
+	}
+
+	leaderEvents := listener.GetLeaderEvents()
+	if len(leaderEvents) != 1 || leaderEvents[0].Type != EvtLeaderExpired {
+		t.Fatalf("expected %s event, got %+v", EvtLeaderExpired, leaderEvents)
+	}
+}
+
+func TestBuildMembershipEvent_DeleteWithoutPrevKV(t *testing.T) {
+	evt, err := buildMembershipEvent(&clientv3.Event{
+		Type: clientv3.EventTypeDelete,
+		Kv: &mvccpb.KeyValue{
+			Key: []byte(membersKey + "node-2"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildMembershipEvent returned error: %v", err)
+	}
+
+	if evt.Type != EvtMemberLeft {
+		t.Fatalf("expected %s, got %s", EvtMemberLeft, evt.Type)
+	}
+	if evt.Member == nil || evt.Member.Name != "node-2" {
+		t.Fatalf("expected fallback member name node-2, got %+v", evt.Member)
+	}
+}
+
+func TestCloseWithActiveWatcherReturns(t *testing.T) {
+	election := &LeibrixLeaderElection{
+		config:    createTestConfig("test-node", "http://localhost:2379"),
+		myNode:    &MemberNode{Name: "test-node"},
+		listeners: make(map[uint64]*sink),
+	}
+
+	election.Watch(NewTestListener())
+
+	done := make(chan struct{})
+	go func() {
+		if err := election.Close(); err != nil {
+			t.Errorf("Close returned error: %v", err)
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("Close blocked with an active watcher")
+	}
+}
+
+func TestLeaderEventsSurviveMembershipBackpressure(t *testing.T) {
+	election := &LeibrixLeaderElection{
+		config:    createTestConfig("test-node", "http://localhost:2379"),
+		myNode:    &MemberNode{Name: "test-node"},
+		listeners: make(map[uint64]*sink),
+	}
+
+	listener := newBlockingListener()
+	unwatch := election.Watch(listener)
+	defer unwatch()
+
+	election.broadcastMembershipEvent(MembershipEvent{
+		Type:   EvtMemberJoined,
+		Member: &MemberNode{Name: "member-1"},
+	})
+
+	select {
+	case <-listener.membershipStarted:
+	case <-time.After(time.Second):
+		t.Fatal("membership callback did not start")
+	}
+
+	for i := 0; i < listenerQueueSize; i++ {
+		election.broadcastMembershipEvent(MembershipEvent{
+			Type:   EvtMemberUpdated,
+			Member: &MemberNode{Name: fmt.Sprintf("member-%d", i+2)},
+		})
+	}
+
+	election.broadcastLeaderEvent(LeaderEvent{
+		Type:   EvtLeaderExpired,
+		Member: &MemberNode{Name: "test-node"},
+	})
+
+	close(listener.releaseMembership)
+
+	select {
+	case ev := <-listener.leaderEvents:
+		if ev.Type != EvtLeaderExpired {
+			t.Fatalf("expected leader expiration event, got %s", ev.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("leader event was dropped under membership backpressure")
 	}
 }
 

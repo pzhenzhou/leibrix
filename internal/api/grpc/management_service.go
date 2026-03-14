@@ -16,9 +16,10 @@ type ManagementRPCService struct {
 	myproto.UnimplementedManagementServiceServer
 	config     *conf.LeibrixConfig
 	etcdClient *clientv3.Client
+	leadership LeadershipProvider
 }
 
-func NewManagementService(config *conf.LeibrixConfig) (myproto.ManagementServiceServer, error) {
+func NewManagementService(config *conf.LeibrixConfig, leadership LeadershipProvider) (myproto.ManagementServiceServer, error) {
 	cli, err := common.NewEtcdClient(config.ClusterConfig.ListenClientUrls)
 	if err != nil {
 		logger.Error(err, "Failed to create etcd client")
@@ -36,10 +37,14 @@ func NewManagementService(config *conf.LeibrixConfig) (myproto.ManagementService
 	return &ManagementRPCService{
 		config:     config,
 		etcdClient: cli,
+		leadership: leadership,
 	}, nil
 }
 
 func (m *ManagementRPCService) AdmitDataset(ctx context.Context, request *myproto.AdmitDatasetRequest) (*myproto.AdmitDatasetResponse, error) {
+	if err := requireLeader(m.leadership, m.config.Node.NodeName); err != nil {
+		return nil, err
+	}
 	logger.Info("ManagementRPCService AdmitDataset called", "clientIp", getClientIp(ctx))
 	if err := m.validateAdmitRequest(request); err != nil {
 		logger.Error(err, "Invalid AdmitDataset request")
@@ -164,6 +169,9 @@ func (m *ManagementRPCService) validateAdmitRequest(request *myproto.AdmitDatase
 }
 
 func (m *ManagementRPCService) UpsertTenantQuota(ctx context.Context, request *myproto.TenantQuota) (*myproto.CommonResponse, error) {
+	if err := requireLeader(m.leadership, m.config.Node.NodeName); err != nil {
+		return nil, err
+	}
 	logger.Info("ManagementRPCService UpsertTenantQuota called", "clientIp", getClientIp(ctx))
 	if request.TenantId == "" {
 		logger.Error(fmt.Errorf("tenant_id is empty"), "UpsertTenantQuota failed")

@@ -3,11 +3,14 @@ package grpc
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/pzhenzhou/leibri.io/internal/api/grpc/events"
 	"github.com/pzhenzhou/leibri.io/internal/conf"
 	myproto "github.com/pzhenzhou/leibri.io/pkg/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -18,18 +21,28 @@ type ControlPlaneService struct {
 	dispatcher     *events.EventDispatcher
 	sessionManager *events.SessionManager
 	config         *conf.LeibrixConfig
+	leadership     LeadershipProvider
 }
 
-func NewControlPlaneService(config *conf.LeibrixConfig, dispatcher *events.EventDispatcher, sessionManager *events.SessionManager) myproto.ControlPlaneServiceServer {
+func NewControlPlaneService(
+	config *conf.LeibrixConfig,
+	dispatcher *events.EventDispatcher,
+	sessionManager *events.SessionManager,
+	leadership LeadershipProvider,
+) myproto.ControlPlaneServiceServer {
 	events.RegisterAllEventHandlers(dispatcher, config)
 	c := &ControlPlaneService{
 		config:         config,
 		dispatcher:     dispatcher,
 		sessionManager: sessionManager,
+		leadership:     leadership,
 	}
 	return c
 }
 func (c *ControlPlaneService) CoordinateWorker(stream grpc.BidiStreamingServer[myproto.EventStreamMessage, myproto.EventStreamMessage]) error {
+	if err := requireLeader(c.leadership, c.config.Node.NodeName); err != nil {
+		return err
+	}
 	clientIp := getClientIp(stream.Context())
 	logger.Info("ControlPlaneService CoordinateWorker called", "clientIp", clientIp)
 
@@ -39,6 +52,7 @@ func (c *ControlPlaneService) CoordinateWorker(stream grpc.BidiStreamingServer[m
 
 	// Track worker ID for session management
 	var workerID string
+	recvCh := c.receiveWorkerMessages(session, stream)
 	defer func() {
 		// Unregister session when stream closes
 		if workerID != "" {
@@ -50,8 +64,27 @@ func (c *ControlPlaneService) CoordinateWorker(stream grpc.BidiStreamingServer[m
 
 	// Main receive loop
 	for {
-		msg, err := stream.Recv()
+		var (
+			msg *myproto.EventStreamMessage
+			err error
+		)
+		select {
+		case <-session.Done():
+			logger.Info("Worker stream closed after leadership change",
+				"worker_id", workerID,
+				"client_ip", clientIp)
+			return status.Error(codes.FailedPrecondition, "control plane leadership changed; reconnect to the leader")
+		case recvResult, ok := <-recvCh:
+			if !ok {
+				return nil
+			}
+			msg, err = recvResult.msg, recvResult.err
+		}
 		if err != nil {
+			if err == io.EOF {
+				logger.Info("Worker stream closed by client", "worker_id", workerID, "client_ip", clientIp)
+				return nil
+			}
 			logger.Error(err, "Error receiving message from worker",
 				"worker_id", workerID, "client_ip", clientIp)
 			return err
@@ -75,6 +108,33 @@ func (c *ControlPlaneService) CoordinateWorker(stream grpc.BidiStreamingServer[m
 		// Handle event asynchronously to avoid blocking receives
 		go c.handleEventAsync(stream.Context(), session, msg)
 	}
+}
+
+type recvResult struct {
+	msg *myproto.EventStreamMessage
+	err error
+}
+
+func (c *ControlPlaneService) receiveWorkerMessages(
+	session *events.Session,
+	stream grpc.BidiStreamingServer[myproto.EventStreamMessage, myproto.EventStreamMessage],
+) <-chan recvResult {
+	recvCh := make(chan recvResult)
+	go func() {
+		defer close(recvCh)
+		for {
+			msg, err := stream.Recv()
+			select {
+			case recvCh <- recvResult{msg: msg, err: err}:
+			case <-session.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return recvCh
 }
 
 func (c *ControlPlaneService) handleEventAsync(
@@ -121,16 +181,7 @@ func (c *ControlPlaneService) handleEvent(ctx context.Context, reqMsg *myproto.E
 		return c.dispatcher.Dispatch(ctx, events.EventTypeDataAssigment, payload.DataAssignment)
 
 	case *myproto.EventStreamMessage_CommonAck:
-		// TODO : Process common ack
-		logger.Info("Received CommonAck from worker",
-			"event_id", reqMsg.EventId,
-			"worker_id", reqMsg.WorkerId)
-		// Return success ack
-		return events.CreateCommonAckEvent(
-			c.config.Node.NodeName,
-			"ack_received",
-			map[string]interface{}{"status": "ok"},
-		), nil
+		return c.dispatcher.Dispatch(ctx, events.EventTypeCommonAck, payload.CommonAck)
 
 	default:
 		return nil, fmt.Errorf("unknown event type in message %s", reqMsg.EventId)
