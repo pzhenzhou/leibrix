@@ -41,9 +41,10 @@ type MemberNode struct {
 }
 
 type sink struct {
-	ch   chan any
-	done chan struct{}
-	once sync.Once
+	leaderCh chan LeaderEvent
+	memberCh chan MembershipEvent
+	done     chan struct{}
+	once     sync.Once
 }
 
 var logger = common.InitLogger()
@@ -228,8 +229,8 @@ func (l *LeibrixLeaderElection) broadcastLeaderEvent(ev LeaderEvent) {
 
 	logger.Info("broadcasting leader event", "type", string(ev.Type), "leader", ev.Member.Name)
 	for _, s := range sinksToNotify {
-		if !s.trySend(ev) {
-			logger.Info("listener channel full, dropping leader event")
+		if !s.enqueueLeader(ev) {
+			logger.Info("listener closed before leader event delivery")
 		}
 	}
 }
@@ -244,7 +245,7 @@ func (l *LeibrixLeaderElection) broadcastMembershipEvent(ev MembershipEvent) {
 
 	logger.Info("broadcasting membership event", "type", string(ev.Type), "member", ev.Member.Name)
 	for _, s := range sinksToNotify {
-		if !s.trySend(ev) {
+		if !s.enqueueMembership(ev) {
 			logger.Info("listener channel full, dropping membership event")
 		}
 	}
@@ -392,13 +393,19 @@ func (l *LeibrixLeaderElection) Watch(listener Listener) (unwatch func()) {
 			select {
 			case <-s.done:
 				return
-			case ev := <-s.ch:
-				switch v := ev.(type) {
-				case LeaderEvent:
-					listener.OnLeaderChange(v) // BLOCKING by design
-				case MembershipEvent:
-					listener.OnMembershipChange(v) // BLOCKING by design
-				}
+			case ev := <-s.leaderCh:
+				listener.OnLeaderChange(ev)
+				continue
+			default:
+			}
+
+			select {
+			case <-s.done:
+				return
+			case ev := <-s.leaderCh:
+				listener.OnLeaderChange(ev) // BLOCKING by design
+			case ev := <-s.memberCh:
+				listener.OnMembershipChange(ev) // BLOCKING by design
 			}
 		}
 	}()
@@ -468,8 +475,9 @@ func (l *LeibrixLeaderElection) removeListener(id uint64) {
 
 func newSink() *sink {
 	return &sink{
-		ch:   make(chan any, listenerQueueSize),
-		done: make(chan struct{}),
+		leaderCh: make(chan LeaderEvent, 1),
+		memberCh: make(chan MembershipEvent, listenerQueueSize),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -479,7 +487,7 @@ func (s *sink) close() {
 	})
 }
 
-func (s *sink) trySend(ev any) bool {
+func (s *sink) enqueueLeader(ev LeaderEvent) bool {
 	select {
 	case <-s.done:
 		return false
@@ -487,7 +495,35 @@ func (s *sink) trySend(ev any) bool {
 	}
 
 	select {
-	case s.ch <- ev:
+	case s.leaderCh <- ev:
+		return true
+	default:
+	}
+
+	select {
+	case <-s.leaderCh:
+	default:
+	}
+
+	select {
+	case s.leaderCh <- ev:
+		return true
+	case <-s.done:
+		return false
+	default:
+		return false
+	}
+}
+
+func (s *sink) enqueueMembership(ev MembershipEvent) bool {
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+
+	select {
+	case s.memberCh <- ev:
 		return true
 	case <-s.done:
 		return false

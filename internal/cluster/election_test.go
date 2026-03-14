@@ -28,6 +28,32 @@ type TestListener struct {
 	expectingEvents  bool // Track whether ExpectEvents() was called
 }
 
+type blockingListener struct {
+	membershipStarted chan struct{}
+	releaseMembership chan struct{}
+	leaderEvents      chan LeaderEvent
+}
+
+func newBlockingListener() *blockingListener {
+	return &blockingListener{
+		membershipStarted: make(chan struct{}, 1),
+		releaseMembership: make(chan struct{}),
+		leaderEvents:      make(chan LeaderEvent, 1),
+	}
+}
+
+func (l *blockingListener) OnLeaderChange(ev LeaderEvent) {
+	l.leaderEvents <- ev
+}
+
+func (l *blockingListener) OnMembershipChange(MembershipEvent) {
+	select {
+	case l.membershipStarted <- struct{}{}:
+	default:
+	}
+	<-l.releaseMembership
+}
+
 func NewTestListener() *TestListener {
 	return &TestListener{
 		leaderEvents:     make([]LeaderEvent, 0),
@@ -337,6 +363,52 @@ func TestCloseWithActiveWatcherReturns(t *testing.T) {
 	case <-done:
 	case <-time.After(1 * time.Second):
 		t.Fatal("Close blocked with an active watcher")
+	}
+}
+
+func TestLeaderEventsSurviveMembershipBackpressure(t *testing.T) {
+	election := &LeibrixLeaderElection{
+		config:    createTestConfig("test-node", "http://localhost:2379"),
+		myNode:    &MemberNode{Name: "test-node"},
+		listeners: make(map[uint64]*sink),
+	}
+
+	listener := newBlockingListener()
+	unwatch := election.Watch(listener)
+	defer unwatch()
+
+	election.broadcastMembershipEvent(MembershipEvent{
+		Type:   EvtMemberJoined,
+		Member: &MemberNode{Name: "member-1"},
+	})
+
+	select {
+	case <-listener.membershipStarted:
+	case <-time.After(time.Second):
+		t.Fatal("membership callback did not start")
+	}
+
+	for i := 0; i < listenerQueueSize; i++ {
+		election.broadcastMembershipEvent(MembershipEvent{
+			Type:   EvtMemberUpdated,
+			Member: &MemberNode{Name: fmt.Sprintf("member-%d", i+2)},
+		})
+	}
+
+	election.broadcastLeaderEvent(LeaderEvent{
+		Type:   EvtLeaderExpired,
+		Member: &MemberNode{Name: "test-node"},
+	})
+
+	close(listener.releaseMembership)
+
+	select {
+	case ev := <-listener.leaderEvents:
+		if ev.Type != EvtLeaderExpired {
+			t.Fatalf("expected leader expiration event, got %s", ev.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("leader event was dropped under membership backpressure")
 	}
 }
 
